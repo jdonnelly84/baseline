@@ -514,7 +514,7 @@
       </section>
       <section class="stack"><div class="section-h"><h2>Notify me when</h2></div>
         <div class="list">${[['start', 'A match starts', 'When one of your players walks on court'], ['sets', 'Each set ends', 'Set-by-set score updates'], ['result', 'A match finishes', 'Final score and who won'], ['schedule', 'Their next match is scheduled', 'Court and start time in your time zone']].map(([k, l, d]) => `<div class="toggle-row"><div class="lbl"><b>${l}</b><small>${d}</small></div><button class="switch ${S.notif[k] ? 'on' : ''}" role="switch" aria-checked="${!!S.notif[k]}" data-notif="${k}" aria-label="${l}"></button></div>`).join('')}
-          <div class="toggle-row"><div class="lbl"><b>Phone notifications</b><small>${perm === 'granted' ? 'On. Alerts also show when the app is in the background.' : perm === 'denied' ? 'Blocked in this browser. Alerts still appear inside the app.' : perm === 'unsupported' ? (DIRECT ? 'Alerts show here while Baseline is open. With the Baseline widget on your Home Screen, your phone also gets a notification when a followed player starts or finishes a match.' : 'This preview can only show alerts inside the app. The iPhone version also notifies you through its Home Screen widget.') : 'Allow alerts outside the app'}</small></div>${perm === 'default' ? '<button class="btn" data-perm style="padding:8px 12px">Allow</button>' : ''}</div>
+          ${notifRow(perm)}
         </div>
         <button class="btn ghost" data-testnotif>${ICON.bell} Preview an alert</button>
       </section>
@@ -567,13 +567,35 @@
   }
 
   // ---------------------------------------------------------------- notifications
+  // ---------------------------------------------------------------- phone notifications (hosted app)
+  const PUSH = () => (window.BaselineLoader && window.BaselineLoader.push) || null;
+  const pushSettings = () => ({ favs: S.favs.slice(), notif: { ...S.notif }, tz: tz() });
+  let syncTimer = null;
+  function syncPush() { const P = PUSH(); if (!P) return; clearTimeout(syncTimer); syncTimer = setTimeout(() => P.sync(pushSettings()).catch(() => { /* try again next time */ }), 1500); }
+  function notifRow(perm) {
+    const P = PUSH();
+    const row = (text, btn = '') => `<div class="toggle-row"><div class="lbl"><b>Phone notifications</b><small>${text}</small></div>${btn}</div>`;
+    if (!P) {
+      return row(perm === 'granted' ? 'On. Alerts also show when the app is in the background.' : perm === 'denied' ? 'Blocked in this browser. Alerts still appear inside the app.' : perm === 'unsupported' ? (DIRECT ? 'Alerts show here while Baseline is open. With the Baseline widget on your Home Screen, your phone also gets a notification when a followed player starts or finishes a match.' : 'This preview can only show alerts inside the app.') : 'Allow alerts outside the app',
+        perm === 'default' ? '<button class="btn" data-perm style="padding:8px 12px">Allow</button>' : '');
+    }
+    if (P.ios() && !P.standalone()) return row('Open Baseline from its Home Screen icon to turn on notifications.');
+    if (!P.supported()) return row('This browser can’t receive notifications. Alerts still appear inside the app.');
+    if (perm === 'granted') return row('On. Sent by the updater on your computer while it’s on, even when Baseline is closed.', '<button class="btn" data-pushtest style="padding:8px 12px">Test</button>');
+    if (perm === 'denied') return row('Turned off for Baseline. Turn them on in the iPhone Settings app: Notifications, then Baseline.');
+    return row('Get alerts for your players even when Baseline is closed. The updater on your computer sends them while it’s on.', '<button class="btn" data-perm style="padding:8px 12px">Turn on</button>');
+  }
+  function toast(title, body, pid = null) {
+    const box = $('#toasts'); if (!box) return; const el = document.createElement('div');
+    el.className = 'toast'; el.innerHTML = `${avatar({ id: pid }, 'sm')}<div><b>${esc(title)}</b><p>${esc(body)}</p></div>`;
+    box.prepend(el); setTimeout(() => el.remove(), 5200);
+  }
   function pushAlert(a) {
     S.feed.unshift({ ...a, at: new Date().toISOString() }); S.feed = S.feed.slice(0, 50); store.set('feed', S.feed);
     if (S.tab !== 'following' || S.view) { S.unread++; store.set('unread', S.unread); }
-    const box = $('#toasts'); const el = document.createElement('div');
-    el.className = 'toast'; el.innerHTML = `${avatar({ id: a.pid }, 'sm')}<div><b>${esc(a.title)}</b><p>${esc(a.body)}</p></div>`;
-    box.prepend(el); setTimeout(() => el.remove(), 5200);
-    try { if (typeof Notification !== 'undefined' && Notification.permission === 'granted') new Notification(a.title, { body: a.body, tag: a.key }); } catch (e) { /* not allowed here */ }
+    toast(a.title, a.body, a.pid);
+    // The hosted app's system notifications come from the computer (Web Push), so only the other versions show one here.
+    try { if (!PUSH() && typeof Notification !== 'undefined' && Notification.permission === 'granted') new Notification(a.title, { body: a.body, tag: a.key }); } catch (e) { /* not allowed here */ }
   }
   const scoreLine = (m) => (m.a.sets || []).map((s, i) => `${s.g}-${m.b.sets?.[i]?.g ?? ''}`).join(' ');
   // Compare two live snapshots and alert for followed players.
@@ -616,9 +638,10 @@
     if (!id) return;
     S.favs = isFav(id) ? S.favs.filter((x) => x !== id) : [...S.favs, id];
     store.set('favs', S.favs);
+    syncPush();
   }
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-back],[data-sub],[data-scoresub],[data-calf],[data-calpast],[data-newsf],[data-rkkind],[data-rklist],[data-fav],[data-player],[data-drawplayer],[data-drawtype],[data-round],[data-restype],[data-notif],[data-perm],[data-testnotif],[data-clearfeed],[data-theme-set],[data-closesheet]');
+    const el = e.target.closest('[data-tab],[data-open],[data-back],[data-sub],[data-scoresub],[data-calf],[data-calpast],[data-newsf],[data-rkkind],[data-rklist],[data-fav],[data-player],[data-drawplayer],[data-drawtype],[data-round],[data-restype],[data-notif],[data-perm],[data-pushtest],[data-testnotif],[data-clearfeed],[data-theme-set],[data-closesheet]');
     if (!el) return;
     const d = el.dataset;
     if ('closesheet' in d) { if (e.target === el) { S.sheet = null; renderSheet(); } return; }
@@ -637,8 +660,20 @@
     else if (d.drawtype) { S.drawType = d.drawtype; S.drawRound = null; }
     else if (d.round) S.drawRound = +d.round;
     else if (d.restype) S.resType = d.restype;
-    else if (d.notif) { S.notif[d.notif] = !S.notif[d.notif]; store.set('notif', S.notif); S._keepScroll = true; }
-    else if ('perm' in d) { try { Notification.requestPermission().then(() => { S._keepScroll = true; render(); }); } catch (err) { /* unsupported */ } return; }
+    else if (d.notif) { S.notif[d.notif] = !S.notif[d.notif]; store.set('notif', S.notif); syncPush(); S._keepScroll = true; }
+    else if ('perm' in d) {
+      const P = PUSH();
+      if (P) {
+        P.enable(pushSettings()).then((res) => { if (res === 'granted') toast('Notifications are on', 'Tap Test to check one arrives.'); S._keepScroll = true; render(); })
+          .catch((err) => { toast('Couldn’t turn on notifications', String(err && err.message || err)); S._keepScroll = true; render(); });
+      } else { try { Notification.requestPermission().then(() => { S._keepScroll = true; render(); }); } catch (err) { /* unsupported */ } }
+      return;
+    }
+    else if ('pushtest' in d) {
+      PUSH()?.sync(pushSettings(), { test: true }).then(() => toast('Test sent to your computer', 'A notification should arrive within a minute while the computer is on.'))
+        .catch(() => toast('Couldn’t reach the relay', 'Check your connection and try again.'));
+      return;
+    }
     else if ('testnotif' in d) { testAlert(); return; }
     else if ('clearfeed' in d) { S.feed = []; store.set('feed', []); S._keepScroll = true; }
     else if (d.themeSet) { S.theme = d.themeSet; store.set('theme', S.theme); S._keepScroll = true; }
@@ -650,7 +685,7 @@
     S[map[id]] = e.target.value; const pos = e.target.selectionStart; S._keepScroll = true; render();
     const inp = document.getElementById(id); if (inp) { inp.focus(); inp.setSelectionRange(pos, pos); }
   });
-  document.addEventListener('change', (e) => { if (e.target.id === 'tzsel') { S.tz = e.target.value || null; store.set('tz', S.tz); S._keepScroll = true; render(); } });
+  document.addEventListener('change', (e) => { if (e.target.id === 'tzsel') { S.tz = e.target.value || null; store.set('tz', S.tz); syncPush(); S._keepScroll = true; render(); } });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.sheet) { S.sheet = null; renderSheet(); } });
 
   // ---------------------------------------------------------------- boot
@@ -682,6 +717,7 @@
     S.favs = S.favs.filter((id) => D.players[id] || true);
     if (S.tab === 'calendar') { const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; }
     render();
+    syncPush(); // keeps the computer's copy of followed players and alert switches current
     if (LIVE_MODE) {
       setInterval(async () => { if (document.hidden) return; try { const L = await loadLive(); const prev = D.live; D.live = L.live; D.generatedAt = L.at; diffLive(prev, D.live); if (!document.querySelector('input:focus')) { S._keepScroll = true; render(); } } catch (e) { /* retry next tick */ } }, 20000);
       // The full refresh re-reads about 30 pages, so on the phone (no server in between) it runs less often.
