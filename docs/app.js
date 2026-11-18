@@ -4,7 +4,8 @@
   'use strict';
 
   // ---------------------------------------------------------------- state
-  let D = null;                      // the data bundle
+  let D = null;                      // the data bundle on screen: DA (ATP) or DW (WTA)
+  let DA = null, DW = null;
   const LIVE_MODE = !window.ATP_DATA;  // server mode polls /api/live
   const store = {
     get(k, d) { try { const v = localStorage.getItem('baseline.' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -24,12 +25,15 @@
     notif: store.get('notif', { start: true, sets: false, result: true, schedule: true }),
     tz: store.get('tz', null),
     theme: store.get('theme', 'system'),
+    tour: store.get('tour', 'atp'),       // which tour the screens show: atp or wta
     topFix: store.get('topfix', 'auto'),  // top spacing under the status bar: auto, or forced on/off from Settings
     feed: store.get('feed', []),
     unread: store.get('unread', 0),
     sheet: null,
     addQuery: '',
   };
+  const dataFor = (id) => (/^W\d/.test(id || '') ? DW : DA) || D;
+  function withD(data, fn) { const save = D; D = data || save; try { return fn(); } finally { D = save; } }
   const tz = () => S.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Pacific/Auckland';
   const nowRef = () => (D && D.source === 'snapshot' ? new Date(D.generatedAt) : new Date());
 
@@ -37,8 +41,8 @@
   const $ = (s, el = document) => el.querySelector(s);
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmtNum = (n) => (n == null ? '–' : Number(n).toLocaleString('en-NZ'));
-  const catClass = (t) => ({ GS: 'GS', '1000': 'm1000', '500': 'a500', '250': 'a250' }[t] || '');
-  const catLabel = (t) => ({ GS: 'GS', '1000': '1000', '500': '500', '250': '250', WC: 'FINALS', XXI: 'NEXTGEN', DCR: 'DAVIS', UC: 'UNITED', LVR: 'LAVER' }[t] || t);
+  const catClass = (t) => ({ GS: 'GS', '1000': 'm1000', '500': 'a500', '250': 'a250', '125': 'a125' }[t] || '');
+  const catLabel = (t) => ({ GS: 'GS', '1000': '1000', '500': '500', '250': '250', WC: 'FINALS', XXI: 'NEXTGEN', BJK: 'BJK CUP', '125': '125', DCR: 'DAVIS', UC: 'UNITED', LVR: 'LAVER' }[t] || t);
   const tById = (id) => D.tournaments.find((t) => t.id === String(id));
   const player = (id) => (id && D.players[id]) || null;
   const pname = (p) => (p && (player(p.id)?.name || p.name)) || 'TBA';
@@ -55,6 +59,7 @@
   }
   function headshotSrc(id) {
     if (!id) return null;
+    if (/^W\d/.test(id)) { const e = espnEids.get(id); return e ? `https://a.espncdn.com/i/headshots/tennis/players/full/${e}.png` : null; }
     if (D.images) return D.images['p_' + id] || null;
     if (window.BaselineLoader) return window.BaselineLoader.headshot(id);
     return '/api/headshot/' + id;
@@ -182,7 +187,8 @@
   // ESPN's public tennis scoreboard returns every match of a tournament, any season, for a date in its week.
   // Baseline uses it for completed events' results, last year's edition of upcoming events, career numbers,
   // and to keep results, order of play and draws moving when the computer that refreshes the ATP data is off.
-  const ESPN = 'https://site.api.espn.com/apis/site/v2/sports/tennis/atp';
+  const ESPN_ROOT = 'https://site.api.espn.com/apis/site/v2/sports/tennis';
+  const ESPN = ESPN_ROOT + '/atp';
   const ESPN_CORE = 'https://sports.core.api.espn.com/v2/sports/tennis/leagues/atp';
   const kv = (() => {
     let p = null;
@@ -206,9 +212,9 @@
   const nameKeys = (s) => { const n = normName(s); return [n.replace(/ /g, ''), n.split(' ').sort().join('')]; };
   // ESPN names → ATP player ids (exact name, or the same words in another order, e.g. "Wu Yibing" / "Yibing Wu")
   let idIdx = null, idIdxFor = null;
-  function atpId(name) {
-    if (idIdxFor !== D) {
-      idIdx = new Map(); idIdxFor = D;
+  function atpId(name, data = D) {
+    if (idIdxFor !== data) {
+      const D = data; idIdx = new Map(); idIdxFor = data;
       const add = (p) => { if (p && p.id && p.name && !p.name.includes('.')) for (const k of nameKeys(p.name)) if (!idIdx.has(k)) idIdx.set(k, p.id); };
       Object.values(D.players || {}).forEach(add);
       Object.values(D.rankings || {}).forEach((R) => (R.rows || []).forEach((r) => r.players.forEach(add)));
@@ -290,9 +296,14 @@
   }
   // Results for an ATP tournament in a given year, straight from ESPN (cached on the phone; finished weeks never change).
   async function loadEspnEvent(t, year) {
-    const key = t.id + ':' + year;
+    const key = (D.tour || 'atp') + t.id + ':' + year;
     if (S.espn[key] && !S.espn[key].error) return;
     S.espn[key] = { loading: true };
+    if (D.tour === 'wta') {
+      try { const list = await loadWtaPast(t, year, dateFrom(t.end || t.start).getTime() + (Number(t.start.slice(0, 4)) - year) * 365 * 864e5 + 3 * 864e5 < Date.now()); S.espn[key] = list.length ? { wta: list } : { error: `No ${year} results for this event.` }; }
+      catch (e) { S.espn[key] = { error: 'Couldn’t load the results. Check your connection and try again.' }; }
+      S._keepScroll = true; render(); return;
+    }
     try {
       const shift = (Number(t.start.slice(0, 4)) - year) * 364 * 864e5;
       const base = dateFrom(t.start).getTime() - shift + 2 * 864e5;
@@ -308,11 +319,12 @@
     S._keepScroll = true; render();
   }
   function espnResultsView(t, year) {
-    const E = S.espn[t.id + ':' + year];
+    const E = S.espn[(D.tour || 'atp') + t.id + ':' + year];
     if (!E) { setTimeout(() => loadEspnEvent(t, year), 0); return '<div class="empty">Loading results…</div>'; }
     if (E.loading) return '<div class="empty">Loading results…</div>';
     if (E.error) return `<div class="empty">${esc(E.error)}</div>`;
     const dbl = S.resType === 'dbl';
+    if (E.wta) return pastView(t, year, E.wta.filter((x) => x.doubles === dbl).map((x) => ({ tid: t.id, id: x.id, round: x.round, court: x.court, status: 'finished', a: x.a, b: x.b, winner: x.winner, message: x.notes, utc: x.utc })), 'Results from the WTA.');
     const { name, order } = espnRounds(E.ev, dbl);
     const ms = E.ev.matches.filter((m) => m.dbl === dbl && m.a && m.b);
     const rounds = [...new Set(ms.map((m) => name(m.round)))].sort((a, b) => order(a) - order(b));
@@ -329,13 +341,30 @@
       <p class="note" style="text-align:center">Results from ESPN.</p>`;
   }
 
+  function pastView(t, year, list) {
+    const order = espnRounds({ matches: [] }, false).order;
+    const rounds = [...new Set(list.map((m) => m.round))].sort((a, b) => order(a) - order(b));
+    const champ = list.find((m) => m.round === 'Final' && m.winner != null) || null;
+    const rd = S.pastRound && rounds.includes(S.pastRound) ? S.pastRound : (rounds.includes('Final') ? 'Final' : rounds[rounds.length - 1]);
+    const shown = list.filter((m) => m.round === rd).sort((a, b) => (a.utc > b.utc) - (a.utc < b.utc));
+    const win = champ ? (champ.winner === 0 ? champ.a : champ.b) : null, lose = champ ? (champ.winner === 0 ? champ.b : champ.a) : null;
+    return `<div class="seg">${[['sgl', 'Singles'], ['dbl', 'Doubles']].map(([k, l]) => `<button data-restype="${k}" class="${S.resType === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+      ${win ? `<button class="list fav-card champ" data-player="${esc(win.players[0].id || '')}">${win.players.length === 1 ? avatar(win.players[0]) : ''}<div><b>${win.players.map((p) => `${flag(p.country)} ${esc(win.players.length > 1 ? shortName(p) : pname(p))}`).join(' / ')}</b><div class="st">Beat ${esc(lose.players.map((p) => shortName(p)).join(' / '))} ${esc(win.sets.map((x, i) => `${x.g}-${lose.sets[i]?.g ?? ''}`).join(' '))}</div></div><span class="crown">${year} champion</span></button>` : ''}
+      ${rounds.length ? `<label class="pick"><span>Round</span><select class="select" id="roundsel">${rounds.map((r) => `<option value="${esc(r)}" ${r === rd ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select></label>` : ''}
+      ${shown.length ? shown.map((m) => matchCard(m, { showEvent: false })).join('') : '<div class="empty">No matches in this round.</div>'}
+      <p class="note" style="text-align:center">Results from the WTA.</p>`;
+  }
+
   // When the computer's ATP data is old (computer off), fill this week's results, order of play and draws from ESPN.
-  async function espnRefresh() {
-    if (!D || !D.dataAt || Date.now() - new Date(D.dataAt) < 90 * 60e3) return false;
+  async function espnRefresh() { const save = D; D = DA; try { return await espnRefreshA(); } finally { if (D === DA) D = save; } }
+  async function espnRefreshA() {
+    const A = DA;
+    if (!A || !A.dataAt || Date.now() - new Date(D.dataAt) < 90 * 60e3) return false;
     const today = new Date().toISOString().slice(0, 10);
     const ts = D.tournaments.filter((t) => ['250', '500', '1000', 'GS', 'WC', 'XXI'].includes(t.type) && t.start && t.start <= today && t.end >= new Date(Date.now() - 864e5).toISOString().slice(0, 10));
     if (!ts.length) return false;
     let week; try { week = await espnNow(); } catch (e) { return false; }
+    D = A; // the rest runs in one go against the ATP data
     let used = false;
     for (const t of ts) {
       const ev = espnMatch(t, week); if (!ev) continue;
@@ -382,10 +411,178 @@
   // Career numbers for the player sheet (ESPN; players in ESPN's top 150 or seen in its results)
   async function espnCareer(id) {
     if (!espnEids.has(id)) {
-      try { const rk = await espnJson(`${ESPN}/rankings`, 12 * 3600e3, (j) => ((j.rankings && j.rankings[0] && j.rankings[0].ranks) || []).map((r) => ({ eid: r.athlete && r.athlete.id, name: r.athlete && r.athlete.displayName }))); rk.forEach((r) => { const a = atpId(r.name); if (a && r.eid && !espnEids.has(a)) espnEids.set(a, r.eid); }); } catch (e) { return null; }
+      const tour = /^W\d/.test(id) ? 'wta' : 'atp'; const data = dataFor(id);
+      try { const rk = await espnJson(`${ESPN_ROOT}/${tour}/rankings`, 12 * 3600e3, (j) => ((j.rankings && j.rankings[0] && j.rankings[0].ranks) || []).map((r) => ({ eid: r.athlete && r.athlete.id, name: r.athlete && r.athlete.displayName }))); rk.forEach((r) => { const a = atpId(r.name, data); if (a && r.eid && !espnEids.has(a)) espnEids.set(a, r.eid); }); } catch (e) { return null; }
     }
     const eid = espnEids.get(id); if (!eid) return null;
-    return espnJson(`${ESPN_CORE}/athletes/${eid}/statistics`, 24 * 3600e3, (j) => { const o = {}; ((j.splits && j.splits.categories) || []).forEach((c) => (c.stats || []).forEach((s) => { o[s.name] = s.value; })); return o; });
+    return espnJson(`${ESPN_CORE.replace('/atp', /^W\d/.test(id) ? '/wta' : '/atp')}/athletes/${eid}/statistics`, 24 * 3600e3, (j) => { const o = {}; ((j.splits && j.splits.categories) || []).forEach((c) => (c.stats || []).forEach((s) => { o[s.name] = s.value; })); return o; });
+  }
+
+  // ---------------------------------------------------------------- WTA
+  // The WTA's data service (calendar, rankings, and each tournament's matches: live scores, results, order of play and
+  // the draw) only answers its own website in a browser, so the app reads it through the Baseline alerts service
+  // (worker/, /wta/...), which passes it on untouched. News, career numbers and player photos come from ESPN.
+  // Everything here runs on the phone; the computer isn't involved.
+  const SERVICE = () => window.BASELINE_ALERTS || 'https://baseline-alerts.jdonnelly84.workers.dev';
+  const isW = (id) => /^W\d/.test(id || '');
+  const titleCase = (s) => (s || '').toLowerCase().replace(/(^|[\s\-+/'(.])([a-zà-ÿ])/g, (m, a, b) => a + b.toUpperCase());
+  function wtaTournament(t) {
+    const g = t.tournamentGroup || {};
+    const type = /UNITED CUP/i.test(g.name || '') ? 'UC' : /BILLIE|BJK/i.test((g.name || '') + t.title) ? 'BJK'
+      : ({ 'Grand Slam': 'GS', 'WTA 1000': '1000', 'WTA 500': '500', 'WTA 250': '250', 'WTA 125': '125', Finals: 'WC' }[t.level] || t.level || '');
+    const name = (t.title || '').split(' - ')[0].trim() || titleCase(g.name);
+    const city = titleCase((t.city || '').replace(/\s*\+\s*/g, '-').split(',')[0]);
+    const slug = (g.name || name).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z]+/g, '-').replace(/^-|-$/g, '');
+    return { id: String(g.id), year: t.year, name, city, country: t.country, location: [city, t.country].filter(Boolean).join(', '), type, typeLabel: t.level,
+      start: t.startDate, end: t.endDate, surface: t.surface || '', inOut: t.inOutdoor === 'I' ? 'Indoor' : 'Outdoor', sgl: t.singlesDrawSize || null, dbl: t.doublesDrawSize || null,
+      prize: t.prizeMoney ? (t.prizeMoneyCurrency === 'USD' || !t.prizeMoneyCurrency ? '$' : t.prizeMoneyCurrency + ' ') + Number(t.prizeMoney).toLocaleString('en-US') : '',
+      flag: t.country, site: `https://www.wtatennis.com/tournaments/${g.id}/${slug}/${t.year}` };
+  }
+  const wtaEntry = (e) => (e ? ({ Wc: 'WC', WC: 'WC', Q: 'Q', LL: 'LL', PR: 'PR', SE: 'SE', Alt: 'Alt', ALT: 'Alt' }[e] || e) : null);
+  function wtaTeam(m, s) {
+    const players = ['', '2'].map((k) => ({ id: m['PlayerID' + s + k] ? 'W' + m['PlayerID' + s + k] : null, name: [m['PlayerNameFirst' + s + k], m['PlayerNameLast' + s + k]].filter(Boolean).join(' '), country: m['PlayerCountry' + s + k] || null }))
+      .filter((p) => p.id || p.name);
+    return { players, seed: m['Seed' + s] && /^\d+$/.test(m['Seed' + s]) ? +m['Seed' + s] : null, entry: wtaEntry(m['EntryType' + s]) };
+  }
+  function wtaSets(m) {
+    const A = [], B = [];
+    for (let i = 1; i <= 5; i++) {
+      const a = m['ScoreSet' + i + 'A'], b = m['ScoreSet' + i + 'B'];
+      if (a === '' || a == null || b === '' || b == null) break;
+      const ga = +a, gb = +b, tb = m['ScoreTbSet' + i] !== '' && m['ScoreTbSet' + i] != null ? +m['ScoreTbSet' + i] : null;
+      A.push({ g: ga, tb: tb != null && ga < gb ? tb : null }); B.push({ g: gb, tb: tb != null && gb < ga ? tb : null });
+    }
+    return [A, B];
+  }
+  const wtaWinner = (m) => ({ 2: 0, 4: 0, 3: 1, 5: 1 }[m.Winner] ?? null); // 4/5: won by retirement or walkover
+  const wtaNum = (m) => parseInt(String(m.MatchID || '').slice(2), 10) || 0;
+  const wtaMain = (m) => m.DrawLevelType !== 'Q' && /^L/.test(m.MatchID || '');
+  function wtaRound(m) {
+    if (!wtaMain(m)) { const r = String(m.RoundID || ''); return /^\d$/.test(r) ? `${r}${['st', 'nd', 'rd'][+r - 1] || 'th'} Round Qualifying` : 'Qualifying'; }
+    const L = Math.floor(Math.log2(wtaNum(m) || 1));
+    return L === 0 ? 'Final' : L === 1 ? 'Semi-Finals' : L === 2 ? 'Quarter-Finals' : `Round of ${2 ** (L + 1)}`;
+  }
+  // a WTA match in the app's match shape
+  function wtaMatch(m) {
+    const a = wtaTeam(m, 'A'), b = wtaTeam(m, 'B'); const [sa, sb] = wtaSets(m); a.sets = sa; b.sets = sb;
+    const w = wtaWinner(m); a.won = w === 0; b.won = w === 1;
+    const state = m.MatchState === 'F' ? 'finished' : m.MatchState === 'P' ? 'live' : m.MatchState === 'U' ? 'scheduled' : sa.length ? 'suspended' : 'scheduled';
+    return { id: m.MatchID, round: wtaRound(m), court: m.CourtName || '', doubles: m.DrawMatchType === 'D', state, a, b, winner: w,
+      duration: m.MatchTimeTotal || '', notes: /^[45]$/.test(m.Winner) ? 'Retired' : '', game: [m.PointA, m.PointB], serve: m.Serve, utc: m.MatchTimeStamp || null, raw: m };
+  }
+  // The draw: WTA numbers main-draw matches like a family tree (the final is 1, its two semis 2 and 3, match n is fed
+  // by 2n and 2n+1), so the bracket order, byes and each player's path come straight from the numbers.
+  function wtaDraw(list, dbl) {
+    const by = new Map();
+    list.forEach((x) => { if (wtaMain(x.raw) && x.doubles === dbl) by.set(wtaNum(x.raw), x); });
+    if (!by.size) return null;
+    const levels = Math.floor(Math.log2(Math.max(...by.keys()))) + 1;
+    const tba = () => ({ players: [], seed: null, entry: null, sets: [], won: false });
+    const bye = () => ({ players: [{ id: null, name: 'Bye', country: null }], seed: null, entry: null, sets: [], won: false });
+    const winnerOf = (x) => (x && x.winner != null ? (x.winner === 0 ? x.a : x.b) : null);
+    const node = new Map(); const rounds = [];
+    for (let L = levels - 1; L >= 0; L--) {
+      const matches = [];
+      for (let i = 0; i < 1 << L; i++) {
+        const n = (1 << L) + i; const x = by.get(n);
+        let out;
+        if (x) out = { a: x.a, b: x.b, winner: x.winner, id: x.id };
+        else if (L === levels - 1) {
+          // no first-round match here: a bye. The player shows up in the next round, on the side the sibling didn't fill.
+          const parent = by.get(n >> 1); const sib = by.get(n ^ 1);
+          const key = (t) => (t && t.players || []).map((p) => p.id).join();
+          let p = null;
+          if (parent) { const sw = winnerOf(sib); p = [parent.a, parent.b].find((t) => t && t.players.length && (!sw || key(t) !== key(sw))) || null; }
+          out = { a: p ? { ...p, sets: [], won: true } : tba(), b: bye(), winner: p ? 0 : null, id: null };
+        } else {
+          const ca = node.get(2 * n), cb = node.get(2 * n + 1);
+          const wa = winnerOf(ca), wb = winnerOf(cb);
+          out = { a: wa && wa.players[0]?.name !== 'Bye' ? { ...wa, sets: [], won: false } : tba(), b: wb && wb.players[0]?.name !== 'Bye' ? { ...wb, sets: [], won: false } : tba(), winner: null, id: null };
+        }
+        node.set(n, out); matches.push(out);
+      }
+      rounds.push({ name: L === 0 ? 'Final' : L === 1 ? 'Semi-Finals' : L === 2 ? 'Quarter-Finals' : `Round of ${2 ** (L + 1)}`, matches });
+    }
+    return { rounds };
+  }
+  const isoDayIn = (utc) => new Date(utc).toLocaleDateString('en-CA', { timeZone: tz() });
+  const longDay = (iso) => dateFrom(iso).toLocaleDateString('en-NZ', { weekday: 'short', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+  // One tournament's matches → results by day, order of play, draws and the live scores
+  function wtaEvent(t, json) {
+    const list = ((json && json.matches) || []).filter((m) => m.MatchID && (m.PlayerNameLastA || m.PlayerIDA)).map(wtaMatch);
+    const results = (dbl) => {
+      const byDay = {};
+      list.filter((x) => x.doubles === dbl && x.state === 'finished').forEach((x) => { const k = x.utc ? isoDayIn(x.utc) : '0'; (byDay[k] ||= []).push(x); });
+      return Object.keys(byDay).sort().reverse().map((k) => ({ date: k === '0' ? '' : longDay(k), day: '', iso: k,
+        matches: byDay[k].sort((p, q) => (q.utc > p.utc) - (q.utc < p.utc)).map((x) => ({ id: x.id, round: x.round, court: x.court, duration: x.duration, a: x.a, b: x.b, notes: x.notes })) }));
+    };
+    // order of play: the matches still to come, by the tournament's own date and court
+    const byDay = {};
+    list.filter((x) => x.state === 'scheduled' && x.utc).forEach((x) => {
+      const r = x.raw; const k = String(r.MatchTimeStamp).slice(0, 10); const later = /T23:59/.test(r.MatchTimeStamp) || /followed/i.test(r.NotBeforeText || '');
+      const court = r.CourtName || 'Court to be confirmed';
+      ((byDay[k] ||= {})[court] ||= []).push({ utc: later ? null : new Date(r.MatchTimeStamp).toISOString(), suffix: /not before/i.test(r.NotBeforeText || '') ? 'Not Before' : 'Starts At',
+        display: later ? '' : (r.NotBefore || '').replace(/^Starting at /i, 'Starts At ').replace(/^Not before /i, 'Not Before '), round: x.round, status: 'Vs', score: null, a: x.a, b: x.b });
+    });
+    const schedule = Object.keys(byDay).sort().map((k) => ({ date: k, label: longDay(k), courts: Object.entries(byDay[k]).map(([court, matches]) => ({ court, matches })) }));
+    const live = list.filter((x) => x.state === 'live' || x.state === 'suspended').map((x) => ({
+      id: x.id, round: x.round, court: x.court, doubles: x.doubles, status: x.state === 'live' ? 'live' : 'suspended', rawStatus: x.raw.MatchState,
+      server: x.serve === 'A' ? 1 : x.serve === 'B' ? 2 : null, duration: x.duration, message: '', updated: x.raw.LastUpdated, winner: null, umpire: '',
+      a: { ...x.a, game: x.game[0] }, b: { ...x.b, game: x.game[1] } }));
+    return { event: { results: results(false), resultsDbl: results(true), schedule, draws: wtaDraw(list, false), drawsDbl: wtaDraw(list, true), groups: [] },
+      live: live.length ? { id: t.id, title: t.name, city: t.city, matches: live } : null, list };
+  }
+  const wtaRows = (arr) => (Array.isArray(arr) ? arr : (arr && arr.content) || []).map((r) => {
+    const p = r.player || {}; const dob = p.dateOfBirth ? new Date(p.dateOfBirth) : null;
+    return { rank: r.ranking, players: [{ id: 'W' + p.id, name: p.fullName, country: p.countryCode }], age: dob ? String(Math.floor((Date.now() - dob) / 31557600000)) : null,
+      points: r.points, pointsMove: null, tourns: r.tournamentsPlayed ?? null, dropping: null, nextBest: null, next: null, max: null, current: null, rankMove: r.movement || null, at: r.rankedAt };
+  });
+  const wtaCurrent = (t) => { const now = Date.now(); return t.start && t.type !== 'UC' && dateFrom(t.start) - now < 1.5 * 864e5 && now - dateFrom(t.end) < 1.5 * 864e5; };
+  // Everything the WTA side shows, built on the phone. matchesOnly: just re-read this week's tournaments (live scores).
+  async function loadWta(prev, { matchesOnly = false } = {}) {
+    const base = SERVICE() + '/wta'; const yr = new Date().getFullYear();
+    let W;
+    if (matchesOnly && prev) W = { ...prev, events: { ...prev.events }, live: {} };
+    else {
+      const pages = await Promise.all([0, 1].map((p) => espnJson(`${base}/tournaments?page=${p}&from=${yr}-01-01&to=${yr}-12-31`, 12 * 3600e3).catch(() => null)));
+      const tournaments = pages.flatMap((p) => (p && p.content) || []).map(wtaTournament).filter((t) => t.start).sort((a, b) => (a.start > b.start) - (a.start < b.start));
+      if (!tournaments.length) throw new Error('WTA calendar unavailable');
+      const [s0, s1, d0, d1] = await Promise.all([['singles', 0], ['singles', 1], ['doubles', 0], ['doubles', 1]].map(([k, p]) => espnJson(`${base}/rankings/${k}?page=${p}`, 3 * 3600e3).catch(() => [])));
+      const sgl = wtaRows([...(s0 || []), ...(s1 || [])]), dbl = wtaRows([...(d0 || []), ...(d1 || [])]);
+      const asOf = (sgl[0] && sgl[0].at || '').slice(0, 10);
+      let news = [];
+      try {
+        const n = await espnJson(`${ESPN_ROOT}/wta/news`, 20 * 60e3, (j) => (j.articles || []).map((a) => ({ title: a.headline, url: a.links && a.links.web && a.links.web.href, img: a.images && a.images[0] && a.images[0].url, tag: a.type === 'Media' ? 'Video' : 'News', video: a.type === 'Media', author: a.byline || '' })));
+        news = n.filter((x) => x.url && x.title);
+      } catch (e) { /* news is optional */ }
+      const players = {};
+      const add = (p, k, rank) => { if (!p.id) return; const o = players[p.id] || (players[p.id] = { id: p.id, name: p.name, country: p.country, short: p.name ? p.name.split(' ')[0][0] + '. ' + p.name.split(' ').slice(1).join(' ') : p.name }); if (k) o[k] = rank; };
+      sgl.forEach((r) => add(r.players[0], 'rank', r.rank)); dbl.forEach((r) => add(r.players[0], 'dblRank', r.rank));
+      W = { source: 'live', tour: 'wta', generatedAt: new Date().toISOString(), tournaments, live: {}, events: {}, players,
+        rankings: { sgl: { asOf, rows: sgl }, dbl: { asOf, rows: dbl } }, news, projections: {}, champions: {}, lastYear: {}, flagsSvg: (DA && DA.flagsSvg) || '' };
+    }
+    for (const t of W.tournaments.filter(wtaCurrent)) {
+      try {
+        const j = await espnJson(`${base}/matches/${t.id}/${t.year}`, 15e3);
+        const { event, live, list } = wtaEvent(t, j);
+        if (list.length) W.events[t.id] = event;
+        if (live) W.live[t.id] = live;
+        list.forEach((x) => [x.a, x.b].forEach((tm) => tm.players.forEach((p) => { if (p.id && !W.players[p.id]) W.players[p.id] = { id: p.id, name: p.name, country: p.country, short: p.name.split(' ')[0][0] + '. ' + p.name.split(' ').slice(1).join(' ') }; })));
+      } catch (e) { /* keep what we had for this event */ if (prev && prev.events[t.id]) W.events[t.id] = prev.events[t.id]; }
+    }
+    W.generatedAt = new Date().toISOString();
+    if (!matchesOnly) wtaPhotos(W);
+    return W;
+  }
+  // Player photos: ESPN has them, matched by name through ESPN's WTA rankings
+  function wtaPhotos(W) {
+    espnJson(`${ESPN_ROOT}/wta/rankings`, 12 * 3600e3, (j) => ((j.rankings && j.rankings[0] && j.rankings[0].ranks) || []).map((r) => ({ eid: r.athlete && r.athlete.id, name: r.athlete && r.athlete.displayName })))
+      .then((rk) => { rk.forEach((r) => { const id = atpId(r.name, W); if (id && r.eid) espnEids.set(id, r.eid); }); if (S.tour === 'wta') { S._keepScroll = true; render(); } }).catch(() => {});
+  }
+  // Results of a WTA tournament in any year (completed events, and last year's edition of upcoming ones)
+  async function loadWtaPast(t, year, done) {
+    const j = await espnJson(`${SERVICE()}/wta/matches/${t.id}/${year}`, done ? 30 * 864e5 : 60e3);
+    return wtaEvent({ ...t, year }, j).list.filter((x) => x.state === 'finished' || x.state === 'live');
   }
 
   // ---------------------------------------------------------------- draw path
@@ -437,9 +634,20 @@
   // ---------------------------------------------------------------- rendering: shell
   const TABS = [['scores', 'Scores'], ['calendar', 'Calendar'], ['news', 'News'], ['rankings', 'Rankings'], ['following', 'Following']];
   function render() {
+    D = (S.tour === 'wta' ? DW : DA) || DA || D;
+    if (S.tour === 'wta' && !DW) S._wtaWaiting = true;
+    document.documentElement.dataset.tour = S.tour === 'wta' && DW ? 'wta' : 'atp';
     const scr = $('#screen'); const keep = scr && S._keepScroll ? scr.scrollTop : 0;
     applyTheme();
     let head = '', body = '';
+    if (S.tour === 'wta' && !DW) {
+      head = `<div class="top-row"><h1>${esc(TABS.find(([k]) => k === S.tab)?.[1] || 'WTA')}</h1>${tourSwitch()}</div><div class="sub">WTA</div><div class="tabs lone"></div>`;
+      body = `<div class="pad"><div class="empty">${S.wtaError ? `Couldn’t load the WTA right now (${esc(S.wtaError)}). Check your connection; it tries again shortly.` : 'Loading the WTA…'}</div></div>`;
+      $('#top').innerHTML = head; $('#screen').innerHTML = body;
+      $('#nav').innerHTML = TABS.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k && !S.view ? 'on' : ''}" aria-label="${l}">${ICON[k]}<span>${l}</span></button>`).join('');
+      if (S.tab !== 'following') return;
+      head = ''; body = '';
+    }
     if (S.view && S.view.type === 'tournament') ({ head, body } = viewTournament(S.view));
     else ({ head, body } = ({ scores: viewScores, calendar: viewCalendar, news: viewNews, rankings: viewRankings, following: viewFollowing }[S.tab])());
     $('#top').innerHTML = head;
@@ -449,7 +657,7 @@
     if (S._keepScroll) { $('#screen').scrollTop = keep; S._keepScroll = false; }
     if (S._scrollTo) { const el = document.getElementById(S._scrollTo); if (el) $('#screen').scrollTop = el.offsetTop - 60; S._scrollTo = null; }
   }
-  const tourSwitch = '<div class="tour-switch" title="WTA coming later"><span class="on">ATP</span><span class="off">WTA</span></div>';
+  const tourSwitch = () => '<div class="tour-switch" role="tablist" aria-label="Tour">' + [['atp', 'ATP'], ['wta', 'WTA']].map(([k, l]) => `<button data-tour="${k}" role="tab" aria-selected="${S.tour === k}" class="${S.tour === k ? 'on' : 'off'}">${l}</button>`).join('') + '</div>';
   function snapNote() {
     if (!D) return '';
     return D.source === 'snapshot'
@@ -476,7 +684,7 @@
     const upcoming = evs.flatMap((t) => scheduleItems(t.id)).filter((m) => !/defeat/i.test(m.status) && !m.score && (!m.estUtc || new Date(m.estUtc).getTime() > now - 3 * 3600e3));
     const upF = S.scoresSub === 'all' ? upcoming : S.scoresSub === 'fav' ? upcoming.filter((m) => teamHasFav(m.a) || teamHasFav(m.b)) : upcoming.filter((m) => m.tid === S.scoresSub);
 
-    const head = `<div class="top-row"><h1>Scores</h1>${tourSwitch}</div><div class="sub">${snapNote()}</div>
+    const head = `<div class="top-row"><h1>Scores</h1>${tourSwitch()}</div><div class="sub">${snapNote()}</div>
       <div class="tabs">${[['all', 'All'], ['fav', 'Following'], ...evs.map((t) => [t.id, t.city])].map(([k, l]) => `<button data-scoresub="${k}" class="${S.scoresSub === k ? 'on' : ''}">${esc(l)}</button>`).join('')}</div>`;
     const evCards = evs.map((t) => {
       const st = tournamentState(t); const lc = (D.live[t.id]?.matches || []).filter((m) => ['live'].includes(m.status)).length;
@@ -505,10 +713,10 @@
     const t = tById(v.id); const ev = D.events[t.id]; const st = tournamentState(t);
     const hasEvent = !!(ev || D.live[t.id]);
     const year = Number((t.start || '').slice(0, 4)) || new Date().getFullYear();
-    const espnOk = !['UC', 'DCR', 'LVR'].includes(t.type) && !!t.start;
+    const espnOk = !['UC', 'DCR', 'LVR', 'BJK'].includes(t.type) && !!t.start;
     const subs = hasEvent ? [['live', 'Live'], ['results', 'Results'], ['schedule', 'Schedule'], ['draw', 'Draws'], ['about', 'About']]
       : st === 'past' ? [...(espnOk ? [['past', 'Results']] : []), ['about', 'Overview']]
-      : [['about', 'Overview'], ['field', t.type === 'WC' || t.type === 'XXI' ? 'Qualifying' : 'Projected field'], ...(espnOk ? [['lastyear', `${year - 1} results`]] : [])];
+      : [['about', 'Overview'], ...(D.tour === 'wta' ? [] : [['field', t.type === 'WC' || t.type === 'XXI' ? 'Qualifying' : 'Projected field']]), ...(espnOk ? [['lastyear', `${year - 1} results`]] : [])];
     if (!v.sub || !subs.some(([k]) => k === v.sub)) v.sub = subs[0][0];
     const head = `<div class="top-row"><button class="back" data-back>${ICON.back}<span>Back</span></button><span style="flex:1"></span><span class="cat ${catClass(t.type)}">${catLabel(t.type)}</span></div>
       <div class="top-row" style="margin-top:6px"><h1>${esc(t.city)}</h1></div>
@@ -627,12 +835,14 @@
 
   // ---------------------------------------------------------------- Calendar
   function viewCalendar() {
-    const F = { all: () => true, GS: (t) => t.type === 'GS', 1000: (t) => t.type === '1000', 500: (t) => t.type === '500', 250: (t) => t.type === '250', other: (t) => !['GS', '1000', '500', '250'].includes(t.type) };
+    const W = D.tour === 'wta';
+    const F = { all: () => true, GS: (t) => t.type === 'GS', 1000: (t) => t.type === '1000', 500: (t) => t.type === '500', 250: (t) => t.type === '250', 125: (t) => t.type === '125', other: (t) => !['GS', '1000', '500', '250', '125'].includes(t.type) };
+    if (!F[S.calFilter] || (!W && S.calFilter === '125')) S.calFilter = 'all';
     const list = D.tournaments.filter(F[S.calFilter]).filter((t) => S.calPast || tournamentState(t) !== 'past');
     const byMonth = {};
     list.forEach((t) => { const k = (t.start || '').slice(0, 7); (byMonth[k] ||= []).push(t); });
-    const head = `<div class="top-row"><h1>Calendar</h1>${tourSwitch}</div><div class="sub">${D.tournaments[0]?.start?.slice(0, 4)} season · ${D.tournaments.length} events</div>
-      <div class="tabs">${[['all', 'All'], ['GS', 'Grand Slams'], ['1000', 'Masters 1000'], ['500', 'ATP 500'], ['250', 'ATP 250'], ['other', 'Team & Finals']].map(([k, l]) => `<button data-calf="${k}" class="${S.calFilter === k ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+    const head = `<div class="top-row"><h1>Calendar</h1>${tourSwitch()}</div><div class="sub">${D.tournaments[0]?.start?.slice(0, 4)} season · ${D.tournaments.length} events</div>
+      <div class="tabs">${(W ? [['all', 'All'], ['GS', 'Grand Slams'], ['1000', 'WTA 1000'], ['500', 'WTA 500'], ['250', 'WTA 250'], ['125', 'WTA 125'], ['other', 'Finals & team']] : [['all', 'All'], ['GS', 'Grand Slams'], ['1000', 'Masters 1000'], ['500', 'ATP 500'], ['250', 'ATP 250'], ['other', 'Team & Finals']]).map(([k, l]) => `<button data-calf="${k}" class="${S.calFilter === k ? 'on' : ''}">${l}</button>`).join('')}</div>`;
     const body = `<div class="pad" style="gap:10px">
       <button class="chip ${S.calPast ? 'on' : ''}" data-calpast style="align-self:flex-start">${S.calPast ? 'Hide' : 'Show'} completed events</button>
       ${Object.entries(byMonth).map(([k, ts]) => `<div id="m-${k}"><div class="month-h">${esc(dateFrom(k + '-01').toLocaleDateString('en-NZ', { month: 'long', year: 'numeric', timeZone: 'UTC' }))}</div><div class="list">${ts.map(calRow).join('')}</div></div>`).join('') || '<div class="empty">No events match that filter.</div>'}
@@ -656,14 +866,14 @@
     const tags = ['All', ...new Set(D.news.map((n) => (n.video ? 'Video' : n.tag)).filter(Boolean))].slice(0, 8);
     const items = D.news.filter((n) => S.newsFilter === 'All' || (S.newsFilter === 'Video' ? n.video : n.tag === S.newsFilter));
     const img = (n) => n.imgData || (n.img && !D.images ? (n.img.startsWith('http') ? n.img : window.BaselineLoader ? window.BaselineLoader.image(n.img) : '/api/img?u=' + encodeURIComponent(n.img)) : '');
-    const head = `<div class="top-row"><h1>Latest</h1>${tourSwitch}</div><div class="sub">From atptour.com</div>
+    const head = `<div class="top-row"><h1>Latest</h1>${tourSwitch()}</div><div class="sub">${D.tour === 'wta' ? 'WTA stories from ESPN' : 'From atptour.com'}</div>
       <div class="tabs">${tags.map((t) => `<button data-newsf="${esc(t)}" class="${S.newsFilter === t ? 'on' : ''}">${esc(t)}</button>`).join('')}</div>`;
     // Lead with the first story that has a picture; the rest keep their order.
     const li = Math.max(0, items.findIndex((n) => img(n))); const lead = items[li]; const rest = items.filter((n, i) => i !== li);
     const body = `<div class="pad">
       ${lead ? `<a class="lead" href="${esc(lead.url)}" target="_blank" rel="noopener"><div class="img" style="background-image:url('${esc(img(lead))}')"></div><div class="body"><span class="tag">${esc(lead.video ? 'Video' : lead.tag || 'News')}</span><h3>${esc(lead.title)}</h3>${lead.author ? `<span class="muted" style="font-size:12.5px">${esc(lead.author)}</span>` : ''}</div></a>` : '<div class="empty">No stories.</div>'}
       <div class="list">${rest.map((n) => `<a class="story" href="${esc(n.url)}" target="_blank" rel="noopener"><div><span class="tag">${esc(n.video ? 'Video' : n.tag || 'News')}</span><h4>${esc(n.title)}</h4></div><div class="thumb" style="background-image:url('${esc(img(n))}')">${n.video ? '<span class="play"></span>' : ''}</div></a>`).join('')}</div>
-      <p class="note" style="text-align:center">Stories open on atptour.com.</p>
+      <p class="note" style="text-align:center">Stories open on ${D.tour === 'wta' ? 'espn.com' : 'atptour.com'}.</p>
     </div>`;
     return { head, body };
   }
@@ -673,14 +883,15 @@
     singles: [['sgl', 'Official'], ['sgl_live', 'Live'], ['sgl_race', 'Race to Turin'], ['nextgen', 'Next Gen race']],
     doubles: [['dbl', 'Official'], ['dbl_live', 'Live'], ['dbl_race', 'Team race']],
   };
+  const RKW = { singles: [['sgl', 'Singles']], doubles: [['dbl', 'Doubles']] }; // the WTA publishes no live or race lists to read
   function viewRankings() {
-    const lists = RK[S.rkKind];
+    const lists = (D.tour === 'wta' ? RKW : RK)[S.rkKind];
     if (!lists.some(([k]) => k === S.rkList)) S.rkList = lists[0][0];
     const R = D.rankings[S.rkList] || { rows: [] };
     const q = S.rkQuery.trim().toLowerCase();
     const rows = R.rows.filter((r) => !q || r.players.some((p) => pname(p).toLowerCase().includes(q)));
     const cut = { sgl_race: 8, nextgen: 7, dbl_race: 8 }[S.rkList];
-    const head = `<div class="top-row"><h1>Rankings</h1>${tourSwitch}</div><div class="sub">PIF ATP Rankings${R.asOf ? ' · ' + esc(R.asOf.replace(/\./g, '-')) : ''}</div>
+    const head = `<div class="top-row"><h1>Rankings</h1>${tourSwitch()}</div><div class="sub">${D.tour === 'wta' ? 'WTA Rankings' : 'PIF ATP Rankings'}${R.asOf ? ' · ' + esc(R.asOf.replace(/\./g, '-')) : ''}</div>
       <div class="tabs">${lists.map(([k, l]) => `<button data-rklist="${k}" class="${S.rkList === k ? 'on' : ''}">${l}</button>`).join('')}</div>`;
     const sub = (r) => {
       if (S.rkList.endsWith('_live')) return r.current ? esc(r.current) : r.age ? `Age ${esc(r.age)}` : '';
@@ -739,14 +950,14 @@
   }
   function viewFollowing() {
     const q = S.addQuery.trim().toLowerCase();
-    const matches = q ? Object.values(D.players).filter((p) => p.name && p.name.toLowerCase().includes(q) && !p.name.includes('/')).sort((a, b) => (a.rank || 9999) - (b.rank || 9999)).slice(0, 8) : [];
+    const matches = q ? [...Object.values((DA && DA.players) || {}), ...Object.values((DW && DW.players) || {})].filter((p) => p.name && p.name.toLowerCase().includes(q) && !p.name.includes('/')).sort((a, b) => (a.rank || 9999) - (b.rank || 9999)).slice(0, 8) : [];
     const perm = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
     const head = `<div class="top-row"><h1>Following</h1></div><div class="sub">${S.favs.length} player${S.favs.length === 1 ? '' : 's'} · alerts for their matches</div><div class="tabs lone"></div>`;
     const body = `<div class="pad">
       <section class="stack"><div class="section-h"><h2>Your players</h2></div>
-        <div class="list">${S.favs.map((id) => { const p = player(id) || { id, name: id }; const st = playerStatus(id); return `<div class="fav-card">${avatar(p)}<button data-player="${esc(id)}" style="text-align:left;min-width:0"><b>${flag(p.country)} ${esc(p.name)}</b><div class="st ${st.live ? 'live' : ''}">${esc(st.text)}</div></button><button class="star on" data-fav="${esc(id)}" aria-label="Unfollow">${ICON.star}</button></div>`; }).join('') || '<div class="empty" style="border:0">Follow players from here, the rankings or any match.</div>'}</div>
+        <div class="list">${S.favs.map((id) => withD(dataFor(id), () => { const p = player(id) || { id, name: id }; const st = playerStatus(id); return `<div class="fav-card">${avatar(p)}<button data-player="${esc(id)}" style="text-align:left;min-width:0"><b>${flag(p.country)} ${esc(p.name)}</b><div class="st ${st.live ? 'live' : ''}">${esc(st.text)}</div></button><button class="star on" data-fav="${esc(id)}" aria-label="Unfollow">${ICON.star}</button></div>`; })).join('') || '<div class="empty" style="border:0">Follow players from here, the rankings or any match.</div>'}</div>
         <div class="search">${ICON.search}<input id="addq" placeholder="Add a player" value="${esc(S.addQuery)}" autocomplete="off"></div>
-        ${matches.length ? `<div class="list">${matches.map((p) => `<div class="fav-card">${avatar(p, 'sm')}<button data-player="${esc(p.id)}" style="text-align:left"><b>${flag(p.country)} ${esc(p.name)}</b><div class="st">${p.rank ? 'Singles No. ' + p.rank : p.dblRank ? 'Doubles No. ' + p.dblRank : ''}</div></button><button class="star ${isFav(p.id) ? 'on' : ''}" data-fav="${esc(p.id)}">${isFav(p.id) ? ICON.star : ICON.starO}</button></div>`).join('')}</div>` : ''}
+        ${matches.length ? `<div class="list">${matches.map((p) => `<div class="fav-card">${avatar(p, 'sm')}<button data-player="${esc(p.id)}" style="text-align:left"><b>${flag(p.country)} ${esc(p.name)}</b><div class="st">${/^W\d/.test(p.id) ? 'WTA · ' : 'ATP · '}${p.rank ? 'Singles No. ' + p.rank : p.dblRank ? 'Doubles No. ' + p.dblRank : 'not ranked in the top 200'}</div></button><button class="star ${isFav(p.id) ? 'on' : ''}" data-fav="${esc(p.id)}">${isFav(p.id) ? ICON.star : ICON.starO}</button></div>`).join('')}</div>` : ''}
       </section>
       <section class="stack"><div class="section-h"><h2>Notify me when</h2></div>
         <div class="list">${[['start', 'A match starts', 'When one of your players walks on court'], ['sets', 'Each set ends', 'Set-by-set score updates'], ['result', 'A match finishes', 'Final score and who won'], ['schedule', 'Their next match is scheduled', 'Court and start time in your time zone']].map(([k, l, d]) => `<div class="toggle-row"><div class="lbl"><b>${l}</b><small>${d}</small></div><button class="switch ${S.notif[k] ? 'on' : ''}" role="switch" aria-checked="${!!S.notif[k]}" data-notif="${k}" aria-label="${l}"></button></div>`).join('')}
@@ -777,7 +988,8 @@
   document.addEventListener('touchstart', () => { touching = true; }, { passive: true, capture: true });
   const untouch = () => { touching = false; if (S._sheetDue) { S._sheetDue = false; renderSheet({ soft: true }); } };
   document.addEventListener('touchend', untouch, { capture: true }); document.addEventListener('touchcancel', untouch, { capture: true });
-  function renderSheet({ soft = false } = {}) {
+  function renderSheet(opts = {}) { if (!S.sheet) return renderSheetIn(opts); return withD(dataFor(S.sheet.id), () => renderSheetIn(opts)); }
+  function renderSheetIn({ soft = false } = {}) {
     const host = $('#sheet');
     if (!S.sheet) { host.innerHTML = ''; return; }
     const open = host.querySelector('.sheet'); const same = open && open.dataset.pid === S.sheet.id && !host.querySelector('.sheet-wrap.closing');
@@ -801,11 +1013,11 @@
       <div class="pl-head">${avatar(p, 'lg')}<div style="flex:1;min-width:0"><div class="eyebrow">${flag(p.country)} ${esc(p.country || '')}${sg?.age ? ' · Age ' + esc(sg.age) : ''}</div><h3>${esc(p.name)}</h3><div class="muted" style="font-size:13px;margin-top:4px;${st.live ? 'color:var(--live);font-weight:700' : ''}">${esc(st.text)}</div></div></div>
       <div class="stat-row">
         <div class="stat"><b class="num">${sg ? sg.rank : '–'}</b><span>Singles</span></div>
-        <div class="stat"><b class="num">${rc ? rc.rank : ng ? ng.rank : lv ? lv.rank : '–'}</b><span>${rc ? 'Race' : ng ? 'Next Gen' : 'Live'}</span></div>
+        ${D.tour === 'wta' ? `<div class="stat"><b class="num">${sg ? fmtNum(sg.points) : '–'}</b><span>Points</span></div>` : `<div class="stat"><b class="num">${rc ? rc.rank : ng ? ng.rank : lv ? lv.rank : '–'}</b><span>${rc ? 'Race' : ng ? 'Next Gen' : 'Live'}</span></div>`}
         <div class="stat"><b class="num">${db ? db.rank : '–'}</b><span>Doubles</span></div>
       </div>
       <div style="display:flex;gap:8px"><button class="btn" style="flex:1" data-fav="${esc(id)}">${isFav(id) ? ICON.star + ' Following' : ICON.starO + ' Follow'}</button>
-        ${slug ? `<a class="btn ghost" href="https://www.atptour.com/en/players/${slug}/${id.toLowerCase()}/overview" target="_blank" rel="noopener">${ICON.ext} Profile</a>` : ''}</div>
+        ${slug ? `<a class="btn ghost" href="${/^W\d/.test(id) ? `https://www.wtatennis.com/players/${id.slice(1)}/${slug}` : `https://www.atptour.com/en/players/${slug}/${id.toLowerCase()}/overview`}" target="_blank" rel="noopener">${ICON.ext} Profile</a>` : ''}</div>
       ${rankingBlock(id)}
       ${pathHtml}`;
     if (same) { const b = open.querySelector('.sheet-body'); const y = open.scrollTop; b.innerHTML = bodyHtml; open.scrollTop = y; return; }
@@ -860,7 +1072,7 @@
 
   // ---------------------------------------------------------------- phone notifications (hosted app)
   const PUSH = () => (window.BaselineLoader && window.BaselineLoader.push) || null;
-  const pushSettings = () => ({ names: Object.fromEntries(S.favs.map((id) => [id, (player(id) && player(id).name) || id])), notif: { ...S.notif }, tz: tz() });
+  const pushSettings = () => ({ names: Object.fromEntries(S.favs.map((id) => [id, withD(dataFor(id), () => (player(id) && player(id).name) || id)])), notif: { ...S.notif }, tz: tz() });
   let syncTimer = null;
   function syncPush() { const P = PUSH(); if (!P) return; clearTimeout(syncTimer); syncTimer = setTimeout(() => P.sync(pushSettings()).catch(() => { /* try again next time */ }), 1500); }
   function notifRow(perm) {
@@ -979,7 +1191,7 @@
     syncPush();
   }
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-back],[data-sub],[data-scoresub],[data-calf],[data-calpast],[data-newsf],[data-rkkind],[data-rklist],[data-fav],[data-player],[data-drawplayer],[data-drawtype],[data-round],[data-restype],[data-notif],[data-perm],[data-pushtest],[data-testnotif],[data-clearfeed],[data-theme-set],[data-closesheet],[data-closesheetbtn],[data-topfix]');
+    const el = e.target.closest('[data-tab],[data-open],[data-back],[data-sub],[data-scoresub],[data-calf],[data-calpast],[data-newsf],[data-rkkind],[data-rklist],[data-fav],[data-player],[data-drawplayer],[data-drawtype],[data-round],[data-restype],[data-notif],[data-perm],[data-pushtest],[data-testnotif],[data-clearfeed],[data-theme-set],[data-closesheet],[data-closesheetbtn],[data-topfix],[data-tour]');
     if (!el) return;
     const d = el.dataset;
     if ('closesheet' in d) { if (e.target === el) goBack(); return; }
@@ -994,7 +1206,8 @@
     else if (d.calf) S.calFilter = d.calf;
     else if ('calpast' in d) S.calPast = !S.calPast;
     else if (d.newsf) S.newsFilter = d.newsf;
-    else if (d.rkkind) { S.rkKind = d.rkkind; S.rkList = RK[d.rkkind][0][0]; }
+    else if (d.tour) { if (S.tour === d.tour) return; S.tour = d.tour; store.set('tour', S.tour); if (nav.mine()) { S._quietPop = true; history.go(-(history.state.baseline === 'sheet' && S.view ? 2 : 1)); } S.view = null; S.sheet = null; S.scoresSub = 'all'; S.calFilter = 'all'; S.newsFilter = 'All'; S.rkKind = 'singles'; S.rkList = 'sgl'; S.rkQuery = ''; if (S.tour === 'wta' && !DW) wtaRefresh(); if (S.tab === 'calendar') { render(); const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; } render(); $('#screen').scrollTop = 0; if (S._scrollTo) render(); return; }
+    else if (d.rkkind) { S.rkKind = d.rkkind; S.rkList = (S.tour === 'wta' ? RKW : RK)[d.rkkind][0][0]; }
     else if (d.rklist) S.rkList = d.rklist;
     else if (d.drawtype) { S.drawType = d.drawtype; S.drawRound = null; }
     else if (d.round) S.drawRound = +d.round;
@@ -1123,41 +1336,66 @@
   };
   const DIRECT = !!(window.BaselineLoader && window.BaselineLoader.direct);
   const setFlags = async () => { try { const f = D.flagsSvg || await (await fetch('/api/flags.svg')).text(); $('#flags').innerHTML = f; } catch (e) { /* flags optional */ } };
+  const cacheW = {
+    load() { try { return JSON.parse(localStorage.getItem('baseline.cacheW') || 'null'); } catch (e) { return null; } },
+    save(d) { try { localStorage.setItem('baseline.cacheW', JSON.stringify(d)); } catch (e) { /* full or unavailable */ } },
+  };
+  // WTA: everything on first use, then this week's matches (live scores, results, order of play) every 20 s while the
+  // WTA side is on screen, every minute if you only follow WTA players, and the calendar/rankings every 10 minutes.
+  let wtaBusy = false;
+  async function wtaRefresh(matchesOnly = false) {
+    if (wtaBusy) return; wtaBusy = true;
+    try {
+      const W = await loadWta(DW, { matchesOnly: matchesOnly && !!DW });
+      DW = W; S.wtaError = null; cacheW.save(DW);
+      if (S.tour === 'wta' && !document.querySelector('input:focus, select:focus')) { S._keepScroll = true; render(); }
+    } catch (e) { S.wtaError = String(e && e.message || e); if (S.tour === 'wta' && !DW) render(); }
+    finally { wtaBusy = false; }
+  }
   async function boot() {
-    if (window.ATP_DATA) D = window.ATP_DATA;
+    if (window.ATP_DATA) DA = D = window.ATP_DATA;
     else {
-      const saved = cache.load();
-      if (saved && saved.tournaments) { D = saved; await setFlags(); render(); }
+      const saved = cache.load(); const savedW = cacheW.load();
+      if (savedW && savedW.tournaments) DW = savedW;
+      if (saved && saved.tournaments) { DA = D = saved; await setFlags(); render(); }
       else {
         $('#screen').innerHTML = '<div class="pad"><div class="empty" id="firstload">Loading the latest from atptour.com…</div></div>';
         // First launch on the phone reads every page slowly (about a minute); after that the app opens from its saved copy.
         window.addEventListener('baseline-progress', (e) => { const el = document.getElementById('firstload'); if (el && e.detail.total) el.textContent = `Setting up for the first time… ${e.detail.done} of ${e.detail.total} pages. This takes about a minute, once.`; });
       }
-      try { const fresh = await loadData(); const prev = D; D = fresh; cache.save(D); await setFlags(); if (prev) { S._keepScroll = true; } }
+      try { const fresh = await loadData(); const prev = DA; DA = D = fresh; cache.save(DA); await setFlags(); if (prev) { S._keepScroll = true; } }
       catch (e) {
-        if (!D) { $('#screen').innerHTML = `<div class="pad"><div class="empty">Couldn't load data from atptour.com (${esc(e.message)}). ${DIRECT || window.BaselineLoader?.hosted ? 'Check your connection, wait a minute, then reopen Baseline.' : 'Check the Baseline window is still open, then reload.'}</div></div>`; return; }
+        if (!DA) { $('#screen').innerHTML = `<div class="pad"><div class="empty">Couldn't load data from atptour.com (${esc(e.message)}). ${DIRECT || window.BaselineLoader?.hosted ? 'Check your connection, wait a minute, then reopen Baseline.' : 'Check the Baseline window is still open, then reload.'}</div></div>`; return; }
       }
     }
     if (window.ATP_FLAGS) $('#flags').innerHTML = window.ATP_FLAGS;
-    S.favs = S.favs.filter((id) => D.players[id] || true);
-    if (S.tab === 'calendar') { const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; }
+    if (S.tab === 'calendar') { const m = withD((S.tour === 'wta' ? DW : DA) || DA, () => currentEvents()[0]?.start?.slice(0, 7)); if (m) S._scrollTo = 'm-' + m; }
     render();
-    const fillFromEspn = () => espnRefresh().then((used) => { if (used && !document.querySelector('input:focus, select:focus')) { S._keepScroll = true; render(); } }).catch(() => {});
+    wtaRefresh();
+    const fillFromEspn = () => espnRefresh().then((used) => { if (used && S.tour === 'atp' && !document.querySelector('input:focus, select:focus')) { S._keepScroll = true; render(); } }).catch(() => {});
     if (LIVE_MODE && !DIRECT) { fillFromEspn(); setInterval(() => { if (!document.hidden) fillFromEspn(); }, 3 * 60e3); }
     syncPush(); // keeps the alerts service's copy of followed players and alert switches current
     PUSH()?.needsTurnOn().then((v) => { if (v !== !!S.pushRenew) { S.pushRenew = v; S._keepScroll = true; render(); } }).catch(() => {});
+    const calm = () => !document.querySelector('input:focus, select:focus');
     if (LIVE_MODE) {
-      setInterval(async () => { if (document.hidden) return; try { const L = await loadLive(); const prev = D.live; D.live = L.live; D.generatedAt = L.at; diffLive(prev, D.live); if (!document.querySelector('input:focus')) { S._keepScroll = true; render(); } } catch (e) { /* retry next tick */ } }, 20000);
+      setInterval(async () => { if (document.hidden || !DA) return; try { const A = DA; const L = await loadLive(); const prev = A.live; A.live = L.live; A.generatedAt = L.at; withD(A, () => diffLive(prev, A.live)); if (S.tour === 'atp' && calm()) { S._keepScroll = true; render(); } } catch (e) { /* retry next tick */ } }, 20000);
       // The full refresh re-reads about 30 pages, so on the phone (no server in between) it runs less often.
-      setInterval(async () => { if (document.hidden) return; try { const N = await loadData(); const prev = D; D = N; await espnRefresh().catch(() => {}); cache.save(D); diffSchedule(prev, N); if (!document.querySelector('input:focus, select:focus')) { S._keepScroll = true; render(); } } catch (e) { /* retry */ } }, DIRECT ? 600000 : 300000);
+      setInterval(async () => { if (document.hidden) return; try { const N = await loadData(); const prev = DA; DA = N; await espnRefresh().catch(() => {}); cache.save(DA); withD(DA, () => diffSchedule(prev, N)); if (S.tour === 'atp' && calm()) { S._keepScroll = true; render(); } } catch (e) { /* retry */ } }, DIRECT ? 600000 : 300000);
     }
+    let wtaTicks = 0;
+    setInterval(() => {
+      if (document.hidden) return; wtaTicks++;
+      if (wtaTicks % 30 === 0) wtaRefresh(false);
+      else if (S.tour === 'wta' || (wtaTicks % 3 === 0 && S.favs.some((id) => /^W\d/.test(id)))) wtaRefresh(true);
+    }, 20000);
   }
+
   // What the iPhone home-screen widget shows between its own live-score checks (read by the Scriptable launcher).
   function widgetSummary() {
     if (!D) return null;
     return {
       at: new Date().toISOString(), tz: tz(), favs: S.favs.slice(),
-      players: S.favs.map((id) => { const p = player(id) || { id, name: id }; let st = { text: '' }; try { st = playerStatus(id); } catch (e) { /* partial data */ } return { id, name: p.name, short: shortName({ id, name: p.name }), rank: p.rank || null, status: st.text, live: !!st.live }; }),
+      players: S.favs.map((id) => withD(dataFor(id), () => { const p = player(id) || { id, name: id }; let st = { text: '' }; try { st = playerStatus(id); } catch (e) { /* partial data */ } return { id, name: p.name, short: shortName({ id, name: p.name }), rank: p.rank || null, status: st.text, live: !!st.live }; })),
     };
   }
   window.BaselineApp = { boot, diffLive: (a, b) => diffLive(a, b), get data() { return D; }, widget: widgetSummary,

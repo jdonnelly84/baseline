@@ -430,3 +430,15 @@ body { position: fixed; top: 0; left: 0; right: 0; height: 100%; }
 .sheet { box-sizing: border-box; max-height: calc(var(--app-h, 88vh) - var(--safe-top) - 14px); }
 .sheet-body { display: flex; flex-direction: column; gap: 14px; }
 .sheet-x { right: var(--gx); top: 9px; }
+
+/* ---------- ATP / WTA ---------- */
+.tour-switch button { padding: 4px 11px; border-radius: 999px; font: inherit; letter-spacing: inherit; color: inherit; min-height: 30px; transition: padding .18s ease, background .15s; }
+.tour-switch button.on { background: #fff; color: var(--head-a); }
+.tour-switch button.off { opacity: .6; }
+.top.mini .tour-switch button { padding: 3px 10px; min-height: 26px; }
+:root { --a125: #8fa6c4; }
+.cat.a125 { background: var(--a125); }
+/* the WTA side gets its own header colours so it's always clear which tour is on screen */
+:root[data-tour="wta"] { --head-a: #3b0f4f; --head-b: #b0287a; }
+@media (prefers-color-scheme: light) { :root[data-tour="wta"]:not([data-theme="dark"]) { --head-a: #4a1263; --head-b: #c4307f; } }
+:root[data-tour="wta"][data-theme="light"] { --head-a: #4a1263; --head-b: #c4307f; }
