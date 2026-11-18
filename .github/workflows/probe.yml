@@ -1,0 +1,14 @@
+name: probe
+on:
+  push:
+    paths: ['updater/probe.mjs', '.github/workflows/probe.yml']
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm i --no-save playwright-core@1.49.1
+        working-directory: updater
+      - run: node probe.mjs
+        working-directory: updater
