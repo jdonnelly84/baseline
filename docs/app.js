@@ -24,6 +24,7 @@
     notif: store.get('notif', { start: true, sets: false, result: true, schedule: true }),
     tz: store.get('tz', null),
     theme: store.get('theme', 'system'),
+    topFix: store.get('topfix', 'auto'),  // top spacing under the status bar: auto, or forced on/off from Settings
     feed: store.get('feed', []),
     unread: store.get('unread', 0),
     sheet: null,
@@ -75,6 +76,7 @@
     back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5l-7 7 7 7"/></svg>',
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4 4"/></svg>',
     bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 16V11a6 6 0 1112 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 004 0"/></svg>',
+    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     ext: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 01-1 1H5a1 1 0 01-1-1V7a1 1 0 011-1h5"/></svg>',
   };
 
@@ -443,7 +445,7 @@
     $('#top').innerHTML = head;
     $('#screen').innerHTML = body;
     $('#nav').innerHTML = TABS.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k && !S.view ? 'on' : ''}" aria-label="${l}">${ICON[k]}<span>${l}</span>${k === 'following' && S.unread ? `<span class="dot">${S.unread}</span>` : ''}</button>`).join('');
-    renderSheet();
+    renderSheet({ soft: true });
     if (S._keepScroll) { $('#screen').scrollTop = keep; S._keepScroll = false; }
     if (S._scrollTo) { const el = document.getElementById(S._scrollTo); if (el) $('#screen').scrollTop = el.offsetTop - 60; S._scrollTo = null; }
   }
@@ -759,6 +761,8 @@
         <div class="list">
           <div class="toggle-row"><div class="lbl"><b>Time zone</b><small>Match times are converted to this</small></div><select class="select" id="tzsel">${['', 'Pacific/Auckland', 'Australia/Sydney', 'Asia/Shanghai', 'Asia/Tokyo', 'Europe/London', 'Europe/Paris', 'America/New_York', 'America/Los_Angeles', 'UTC'].map((z) => `<option value="${z}" ${(S.tz || '') === z ? 'selected' : ''}>${z ? z.split('/').pop().replace('_', ' ') : 'This device (' + esc(Intl.DateTimeFormat().resolvedOptions().timeZone.split('/').pop().replace('_', ' ')) + ')'}</option>`).join('')}</select></div>
           <div class="toggle-row"><div class="lbl"><b>Appearance</b></div><div class="seg" style="min-width:210px">${[['system', 'Auto'], ['dark', 'Dark'], ['light', 'Light']].map(([k, l]) => `<button data-theme-set="${k}" class="${S.theme === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+          <div class="toggle-row"><div class="lbl"><b>Top spacing</b><small>If the top of Baseline sits under the clock or camera, pick More</small></div><div class="seg" style="min-width:190px">${[['auto', 'Auto'], ['on', 'More'], ['off', 'Less']].map(([k, l]) => `<button data-topfix="${k}" class="${S.topFix === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+          <div class="toggle-row"><div class="lbl"><b>This screen</b><small>${esc([SCREEN.model ? SCREEN.model + ' size' : null, SCREEN.size, 'layout ' + (document.documentElement.dataset.size || '?'), 'top ' + SCREEN.top + (SCREEN.fallback ? ' (fixed)' : ''), SCREEN.standalone ? 'Home Screen app' : 'in browser'].filter(Boolean).join(' · '))}</small></div></div>
           <div class="toggle-row"><div class="lbl"><b>Data</b><small>${D.source === 'snapshot' ? 'Preview snapshot taken ' + esc(new Date(D.generatedAt).toLocaleString('en-NZ', { timeZone: tz(), day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })) + '. The installed app refreshes live.' : (D.dataAt ? 'Live scores straight from ATP every 20 s. Draws, order of play, results and rankings from the updater on your computer, last refreshed ' + esc(ago(D.dataAt)) + '.' : 'Live from atptour.com · scores every 20 s, everything else every 5 min')}</small></div></div>
         </div>
       </section>
@@ -767,9 +771,17 @@
   }
 
   // ---------------------------------------------------------------- Player sheet
-  function renderSheet() {
+  // soft: refresh the open panel's content in place (live updates, career numbers arriving) without rebuilding it,
+  // keeping its scroll position, and never while a finger is on the screen (that would cut a swipe short).
+  let touching = false;
+  document.addEventListener('touchstart', () => { touching = true; }, { passive: true, capture: true });
+  const untouch = () => { touching = false; if (S._sheetDue) { S._sheetDue = false; renderSheet({ soft: true }); } };
+  document.addEventListener('touchend', untouch, { capture: true }); document.addEventListener('touchcancel', untouch, { capture: true });
+  function renderSheet({ soft = false } = {}) {
     const host = $('#sheet');
     if (!S.sheet) { host.innerHTML = ''; return; }
+    const open = host.querySelector('.sheet'); const same = open && open.dataset.pid === S.sheet.id && !host.querySelector('.sheet-wrap.closing');
+    if (soft && same && touching) { S._sheetDue = true; return; }
     const id = S.sheet.id; const p = player(id) || { id, name: S.sheet.name || 'Player' };
     const find = (k) => D.rankings[k]?.rows.find((r) => r.players.some((x) => x.id === id));
     const sg = find('sgl'), lv = find('sgl_live'), rc = find('sgl_race'), db = find('dbl'), ng = find('nextgen');
@@ -785,8 +797,7 @@
       }
     }
     const slug = (p.name || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z]+/g, '-').replace(/^-|-$/g, '');
-    host.innerHTML = `<div class="sheet-wrap" data-closesheet><div class="sheet" role="dialog" aria-label="${esc(p.name)}">
-      <div class="grab"></div>
+    const bodyHtml = `
       <div class="pl-head">${avatar(p, 'lg')}<div style="flex:1;min-width:0"><div class="eyebrow">${flag(p.country)} ${esc(p.country || '')}${sg?.age ? ' · Age ' + esc(sg.age) : ''}</div><h3>${esc(p.name)}</h3><div class="muted" style="font-size:13px;margin-top:4px;${st.live ? 'color:var(--live);font-weight:700' : ''}">${esc(st.text)}</div></div></div>
       <div class="stat-row">
         <div class="stat"><b class="num">${sg ? sg.rank : '–'}</b><span>Singles</span></div>
@@ -796,7 +807,11 @@
       <div style="display:flex;gap:8px"><button class="btn" style="flex:1" data-fav="${esc(id)}">${isFav(id) ? ICON.star + ' Following' : ICON.starO + ' Follow'}</button>
         ${slug ? `<a class="btn ghost" href="https://www.atptour.com/en/players/${slug}/${id.toLowerCase()}/overview" target="_blank" rel="noopener">${ICON.ext} Profile</a>` : ''}</div>
       ${rankingBlock(id)}
-      ${pathHtml}
+      ${pathHtml}`;
+    if (same) { const b = open.querySelector('.sheet-body'); const y = open.scrollTop; b.innerHTML = bodyHtml; open.scrollTop = y; return; }
+    host.innerHTML = `<div class="sheet-wrap" data-closesheet><div class="sheet" role="dialog" aria-label="${esc(p.name)}" data-pid="${esc(id)}">
+      <div class="sheet-bar"><span class="grab"></span><button class="sheet-x" data-closesheetbtn aria-label="Close">${ICON.close}</button></div>
+      <div class="sheet-body">${bodyHtml}</div>
     </div></div>`;
   }
 
@@ -832,7 +847,7 @@
     }
     if (DB) html += `<section class="stack"><div class="section-h"><h2>Doubles ranking</h2></div><div class="facts rkfacts"><div><span class="eyebrow">Rank</span><b class="num">No. ${DB.r.rank}</b></div><div><span class="eyebrow">Points</span><b class="num">${fmtNum(DB.r.points)}</b></div>${DL && DL.r.rank !== DB.r.rank ? `<div><span class="eyebrow">Live</span><b class="num">No. ${DL.r.rank} · ${fmtNum(DL.r.points)}</b></div>` : ''}</div></section>`;
     const c = career[id];
-    if (c === undefined) { career[id] = null; espnCareer(id).then((v) => { career[id] = v || false; if (S.sheet && S.sheet.id === id) renderSheet(); }).catch(() => { career[id] = false; }); }
+    if (c === undefined) { career[id] = null; espnCareer(id).then((v) => { career[id] = v || false; if (S.sheet && S.sheet.id === id) renderSheet({ soft: true }); }).catch(() => { career[id] = false; }); }
     if (c && (c.singlesWon != null || c.singlesTitles != null)) {
       const w = c.singlesWon || 0, l = c.singlesLost || 0;
       html += `<section class="stack"><div class="section-h"><h2>Career</h2><span class="meta">from ESPN</span></div><div class="facts rkfacts">
@@ -911,7 +926,36 @@
   // Works out the screen it's on and sets data-size on <html>: "sm" for small phones (SE, mini), "md" for the usual
   // 6.1"/6.3" phones, "lg" for Plus/Pro Max sizes, "xl" for tablets and landscape. The CSS sizes spacing, text and
   // columns from it, and the header shrinks while you scroll so the screen is mostly scores.
+  // iPhone screens in points (portrait) and how much the status bar / Dynamic Island takes at the top of a
+  // Home Screen app. Used only when iOS draws the app under the status bar but reports no safe area.
+  const IPHONES = {
+    '375x667': [20, 'iPhone SE / 8'], '414x736': [20, 'iPhone 8 Plus'],
+    '375x812': [50, 'iPhone X / XS / 11 Pro / 12 mini / 13 mini'], '414x896': [48, 'iPhone XR / 11 / XS Max / 11 Pro Max'],
+    '390x844': [47, 'iPhone 12 / 13 / 14 / 16e'], '428x926': [47, 'iPhone 12 Pro Max / 13 Pro Max / 14 Plus'],
+    '393x852': [59, 'iPhone 14 Pro / 15 / 15 Pro / 16'], '430x932': [59, 'iPhone 14 Pro Max / 15 Plus / 15 Pro Max / 16 Plus'],
+    '402x874': [62, 'iPhone 16 Pro / 17 / 17 Pro'], '440x956': [62, 'iPhone 16 Pro Max / 17 Pro Max'], '420x912': [62, 'iPhone Air'],
+  };
+  const SCREEN = {};
+  function safeAreas() {
+    const r = document.documentElement;
+    const probe = document.createElement('div');
+    probe.style.cssText = 'position:fixed;top:0;left:0;width:1px;visibility:hidden;pointer-events:none;height:env(safe-area-inset-top,0px)';
+    document.body.appendChild(probe); const envTop = probe.offsetHeight; probe.remove();
+    const ios = /iPhone|iPod/.test(navigator.userAgent);
+    const standalone = !!(navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches));
+    const sw = Math.min(screen.width, screen.height), sh = Math.max(screen.width, screen.height);
+    const model = IPHONES[sw + 'x' + sh] || null;
+    const portrait = innerHeight > innerWidth;
+    // drawn from the very top of the screen (under the status bar) yet no inset reported: use the phone's known value
+    let fallback = ios && standalone && portrait && envTop === 0 && model && innerHeight >= sh - 2;
+    let top = fallback ? model[0] : envTop;
+    if (S.topFix === 'on') { top = Math.max(envTop, model ? model[0] : 54); fallback = top !== envTop; }
+    if (S.topFix === 'off') { top = 0; fallback = envTop !== 0; }
+    if (fallback) r.style.setProperty('--safe-top', top + 'px'); else r.style.removeProperty('--safe-top');
+    Object.assign(SCREEN, { model: model ? model[1] : null, size: sw + '×' + sh, view: innerWidth + '×' + innerHeight, envTop, top, standalone, fallback });
+  }
   function fit() {
+    try { safeAreas(); } catch (e) { /* layout still works with the CSS values */ }
     const r = document.documentElement; const dev = document.getElementById('device');
     const w = (dev && dev.clientWidth) || innerWidth, h = (dev && dev.clientHeight) || innerHeight;
     r.dataset.size = w >= 700 ? 'xl' : w >= 420 ? 'lg' : w >= 385 && h >= 720 ? 'md' : 'sm';
@@ -935,15 +979,16 @@
     syncPush();
   }
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-back],[data-sub],[data-scoresub],[data-calf],[data-calpast],[data-newsf],[data-rkkind],[data-rklist],[data-fav],[data-player],[data-drawplayer],[data-drawtype],[data-round],[data-restype],[data-notif],[data-perm],[data-pushtest],[data-testnotif],[data-clearfeed],[data-theme-set],[data-closesheet]');
+    const el = e.target.closest('[data-tab],[data-open],[data-back],[data-sub],[data-scoresub],[data-calf],[data-calpast],[data-newsf],[data-rkkind],[data-rklist],[data-fav],[data-player],[data-drawplayer],[data-drawtype],[data-round],[data-restype],[data-notif],[data-perm],[data-pushtest],[data-testnotif],[data-clearfeed],[data-theme-set],[data-closesheet],[data-closesheetbtn],[data-topfix]');
     if (!el) return;
     const d = el.dataset;
-    if ('closesheet' in d) { if (e.target === el) { S.sheet = null; renderSheet(); } return; }
+    if ('closesheet' in d) { if (e.target === el) goBack(); return; }
+    if ('closesheetbtn' in d) { goBack(); return; }
     if (d.fav !== undefined) { toggleFav(d.fav); S._keepScroll = true; render(); return; }
-    if (d.player !== undefined || d.drawplayer !== undefined) { const id = d.player ?? d.drawplayer; if (id) { S.sheet = { id }; renderSheet(); } return; }
-    if (d.tab) { if (S.tab === d.tab && !S.view) { $('#screen').scrollTop = 0; return; } S.tab = d.tab; S.view = null; S.sheet = null; store.set('tab', S.tab); if (d.tab === 'following') { S.unread = 0; store.set('unread', 0); } if (d.tab === 'calendar') { const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; } render(); if (!S._scrollTo) $('#screen').scrollTop = 0; return; }
-    if (d.open) { S._prev = { tab: S.tab, scroll: $('#screen').scrollTop }; S.view = { type: 'tournament', id: d.open }; S.drawRound = null; S.drawQuery = ''; S.resDay = 0; S.schedDay = null; S.pastRound = null; render(); $('#screen').scrollTop = 0; return; }
-    if ('back' in d) { S.view = null; render(); if (S._prev) $('#screen').scrollTop = S._prev.scroll; return; }
+    if (d.player !== undefined || d.drawplayer !== undefined) { const id = d.player ?? d.drawplayer; if (id) openSheet(id); return; }
+    if (d.tab) { if (nav.mine()) { S._quietPop = true; history.go(-(history.state.baseline === 'sheet' && S.view ? 2 : 1)); } if (S.tab === d.tab && !S.view) { $('#screen').scrollTop = 0; return; } S.tab = d.tab; S.view = null; S.sheet = null; store.set('tab', S.tab); if (d.tab === 'following') { S.unread = 0; store.set('unread', 0); } if (d.tab === 'calendar') { const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; } render(); if (!S._scrollTo) $('#screen').scrollTop = 0; return; }
+    if (d.open) { if (!S.view) nav.push('view'); S._prev = { tab: S.tab, scroll: $('#screen').scrollTop }; S.view = { type: 'tournament', id: d.open }; S.drawRound = null; S.drawQuery = ''; S.resDay = 0; S.schedDay = null; S.pastRound = null; render(); $('#screen').scrollTop = 0; return; }
+    if ('back' in d) { goBack(); return; }
     if (d.sub) { S.view.sub = d.sub; render(); $('#screen').scrollTop = 0; return; }
     if (d.scoresub) S.scoresSub = d.scoresub;
     else if (d.calf) S.calFilter = d.calf;
@@ -970,6 +1015,7 @@
     }
     else if ('testnotif' in d) { testAlert(); return; }
     else if ('clearfeed' in d) { S.feed = []; store.set('feed', []); S._keepScroll = true; }
+    else if (d.topfix) { S.topFix = d.topfix; store.set('topfix', S.topFix); fit(); S._keepScroll = true; }
     else if (d.themeSet) { S.theme = d.themeSet; store.set('theme', S.theme); S._keepScroll = true; }
     render();
   });
@@ -986,7 +1032,86 @@
     else if (id === 'schedsel') { S.schedDay = +v; render(); }
     else if (id === 'roundsel') { S.pastRound = v; render(); }
   });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.sheet) { S.sheet = null; renderSheet(); } });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && (S.sheet || S.view)) goBack(); });
+
+  // ---------------------------------------------------------------- getting back out: Back, swipes and the phone's back gesture
+  // Opening a player or a tournament adds a step to the browser history, so Android's back gesture/button and a
+  // computer's Back key close it like the on-screen Back. On the iPhone (no system back in Home Screen apps):
+  // swipe the player panel down to close it, or swipe right from the left edge to leave a tournament.
+  const nav = {
+    push(kind) { try { history.pushState({ baseline: kind }, ''); } catch (e) { /* not allowed here */ } },
+    mine: () => !!(history.state && history.state.baseline),
+  };
+  function openSheet(id) { if (!S.sheet) nav.push('sheet'); S.sheet = { id }; renderSheet(); const sh = $('.sheet'); if (sh) sh.scrollTop = 0; }
+  function closeTop() { // close the panel if one is open, else leave the tournament
+    if (S.sheet) {
+      const w = $('.sheet-wrap'); S.sheet = null;
+      if (w) { w.classList.add('closing'); setTimeout(() => { if (!S.sheet) renderSheet(); }, 200); } else renderSheet();
+      return;
+    }
+    if (S.view) { S.view = null; render(); if (S._prev) $('#screen').scrollTop = S._prev.scroll; }
+  }
+  // Close straight away; the matching history step is removed quietly so the phone's Back stays in step.
+  function goBack() {
+    if (nav.mine()) { S._quietPop = true; setTimeout(() => { S._quietPop = false; }, 600); history.back(); }
+    closeTop();
+  }
+  addEventListener('popstate', () => { if (S._quietPop) { S._quietPop = false; return; } if (S.sheet || S.view) closeTop(); });
+
+  // Swipe the player panel down to close it (from its top bar at any time, or anywhere once it is scrolled to the top).
+  (function () {
+    let g = null;
+    document.addEventListener('touchstart', (e) => {
+      const sh = e.target.closest && e.target.closest('.sheet');
+      g = sh && e.touches.length === 1 ? { sh, x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now(), bar: !!e.target.closest('.sheet-bar'), dy: 0, on: false } : null;
+    }, { passive: true });
+    document.addEventListener('touchmove', (e) => {
+      if (!g) return;
+      const dx = e.touches[0].clientX - g.x, dy = e.touches[0].clientY - g.y;
+      if (!g.on) {
+        if (dy > 6 && dy > Math.abs(dx) && (g.bar || g.sh.scrollTop <= 0)) g.on = true;
+        else if (Math.abs(dx) > 8 || Math.abs(dy) > 8) { g = null; return; } else return;
+      }
+      e.preventDefault();
+      g.dy = Math.max(0, dy - 6);
+      g.sh.style.transition = 'none'; g.sh.style.transform = `translateY(${g.dy}px)`;
+      g.sh.parentNode.style.opacity = String(Math.max(0.35, 1 - g.dy / 500));
+    }, { passive: false });
+    const end = () => {
+      if (!g || !g.on) { g = null; return; }
+      const { sh, dy } = g; const fast = dy / Math.max(1, Date.now() - g.t) > 0.5; g = null;
+      sh.style.transition = 'transform .2s ease';
+      if (dy > 110 || (fast && dy > 30)) { sh.style.transform = 'translateY(105%)'; goBack(); }
+      else { sh.style.transform = ''; sh.parentNode.style.opacity = ''; }
+    };
+    document.addEventListener('touchend', end); document.addEventListener('touchcancel', end);
+  })();
+
+  // Swipe right from the left edge to go back from a tournament (like the iPhone's own back swipe).
+  (function () {
+    let g = null;
+    const parts = () => [$('#top'), $('#screen')];
+    document.addEventListener('touchstart', (e) => {
+      const x = e.touches[0].clientX - ($('#device')?.getBoundingClientRect().left || 0);
+      g = S.view && !S.sheet && e.touches.length === 1 && x < 26 ? { x: e.touches[0].clientX, y: e.touches[0].clientY, on: false, dx: 0 } : null;
+    }, { passive: true });
+    document.addEventListener('touchmove', (e) => {
+      if (!g) return;
+      const dx = e.touches[0].clientX - g.x, dy = e.touches[0].clientY - g.y;
+      if (!g.on) { if (dx > 10 && dx > Math.abs(dy) * 1.5) g.on = true; else if (Math.abs(dy) > 10) { g = null; return; } else return; }
+      e.preventDefault(); g.dx = Math.max(0, dx);
+      parts().forEach((el) => { if (el) { el.style.transition = 'none'; el.style.transform = `translateX(${g.dx}px)`; } });
+    }, { passive: false });
+    const end = () => {
+      if (!g || !g.on) { g = null; return; }
+      const go = g.dx > 80; g = null;
+      parts().forEach((el) => { if (el) { el.style.transition = 'transform .18s ease'; el.style.transform = go ? 'translateX(100%)' : ''; } });
+      setTimeout(() => { parts().forEach((el) => { if (el) { el.style.transition = ''; el.style.transform = ''; } }); if (go) goBack(); }, go ? 170 : 200);
+    };
+    document.addEventListener('touchend', end); document.addEventListener('touchcancel', end);
+  })();
+  // tap a pop-up alert to dismiss it
+  document.addEventListener('click', (e) => { const t = e.target.closest && e.target.closest('.toast'); if (t) t.remove(); });
 
   // ---------------------------------------------------------------- boot
   const loadData = async () => { if (window.BaselineLoader) return window.BaselineLoader.data(); const r = await fetch('/api/data'); if (!r.ok) throw new Error('server ' + r.status); return r.json(); };
