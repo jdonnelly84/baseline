@@ -569,7 +569,7 @@
   // ---------------------------------------------------------------- notifications
   // ---------------------------------------------------------------- phone notifications (hosted app)
   const PUSH = () => (window.BaselineLoader && window.BaselineLoader.push) || null;
-  const pushSettings = () => ({ favs: S.favs.slice(), notif: { ...S.notif }, tz: tz() });
+  const pushSettings = () => ({ names: Object.fromEntries(S.favs.map((id) => [id, (player(id) && player(id).name) || id])), notif: { ...S.notif }, tz: tz() });
   let syncTimer = null;
   function syncPush() { const P = PUSH(); if (!P) return; clearTimeout(syncTimer); syncTimer = setTimeout(() => P.sync(pushSettings()).catch(() => { /* try again next time */ }), 1500); }
   function notifRow(perm) {
@@ -581,9 +581,10 @@
     }
     if (P.ios() && !P.standalone()) return row('Open Baseline from its Home Screen icon to turn on notifications.');
     if (!P.supported()) return row('This browser can’t receive notifications. Alerts still appear inside the app.');
-    if (perm === 'granted') return row('On. Sent by the updater on your computer while it’s on, even when Baseline is closed.', '<button class="btn" data-pushtest style="padding:8px 12px">Test</button>');
+    if (perm === 'granted' && S.pushRenew) return row('Tap Turn on once more to switch to the new always-on alerts.', '<button class="btn" data-perm style="padding:8px 12px">Turn on</button>');
+    if (perm === 'granted') return row('On. Alerts come from the cloud, so they arrive even with your computer off and Baseline closed.', '<button class="btn" data-pushtest style="padding:8px 12px">Test</button>');
     if (perm === 'denied') return row('Turned off for Baseline. Turn them on in the iPhone Settings app: Notifications, then Baseline.');
-    return row('Get alerts for your players even when Baseline is closed. The updater on your computer sends them while it’s on.', '<button class="btn" data-perm style="padding:8px 12px">Turn on</button>');
+    return row('Get alerts for your players even when Baseline is closed and your computer is off.', '<button class="btn" data-perm style="padding:8px 12px">Turn on</button>');
   }
   function toast(title, body, pid = null) {
     const box = $('#toasts'); if (!box) return; const el = document.createElement('div');
@@ -664,13 +665,13 @@
     else if ('perm' in d) {
       const P = PUSH();
       if (P) {
-        P.enable(pushSettings()).then((res) => { if (res === 'granted') toast('Notifications are on', 'Tap Test to check one arrives.'); S._keepScroll = true; render(); })
+        P.enable(pushSettings()).then((res) => { if (res === 'granted') { S.pushRenew = false; toast('Notifications are on', 'Tap Test to check one arrives.'); } S._keepScroll = true; render(); })
           .catch((err) => { toast('Couldn’t turn on notifications', String(err && err.message || err)); S._keepScroll = true; render(); });
       } else { try { Notification.requestPermission().then(() => { S._keepScroll = true; render(); }); } catch (err) { /* unsupported */ } }
       return;
     }
     else if ('pushtest' in d) {
-      PUSH()?.sync(pushSettings(), { test: true }).then(() => toast('Test sent to your computer', 'A notification should arrive within a minute while the computer is on.'))
+      PUSH()?.sync(pushSettings(), { test: true }).then((j) => (j && j.test === 'ok' ? toast('Test sent', 'It should show up in a few seconds.') : toast('Test not sent', (j && j.test) || 'Turn notifications on first.')))
         .catch(() => toast('Couldn’t reach the relay', 'Check your connection and try again.'));
       return;
     }
@@ -717,7 +718,8 @@
     S.favs = S.favs.filter((id) => D.players[id] || true);
     if (S.tab === 'calendar') { const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; }
     render();
-    syncPush(); // keeps the computer's copy of followed players and alert switches current
+    syncPush(); // keeps the alerts service's copy of followed players and alert switches current
+    PUSH()?.needsTurnOn().then((v) => { if (v !== !!S.pushRenew) { S.pushRenew = v; S._keepScroll = true; render(); } }).catch(() => {});
     if (LIVE_MODE) {
       setInterval(async () => { if (document.hidden) return; try { const L = await loadLive(); const prev = D.live; D.live = L.live; D.generatedAt = L.at; diffLive(prev, D.live); if (!document.querySelector('input:focus')) { S._keepScroll = true; render(); } } catch (e) { /* retry next tick */ } }, 20000);
       // The full refresh re-reads about 30 pages, so on the phone (no server in between) it runs less often.

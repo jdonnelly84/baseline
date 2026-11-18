@@ -58,48 +58,59 @@
   const image = (p) => (p.startsWith('http') ? p : ATP + p);
 
   // ---------------------------------------------------------------- notifications
-  // The phone subscribes to Web Push with the computer's public key, then posts its push address, followed players
-  // and alert switches to a relay topic on ntfy.sh. The updater on the computer reads that topic, watches the live
-  // feed and sends the alerts. Nothing secret is posted: a push address only works with the computer's private key.
-  const RELAY = window.BASELINE_RELAY ? 'https://ntfy.sh/' + window.BASELINE_RELAY : null;
+  // Alerts come from "Baseline alerts", a small always-on Cloudflare service (worker/ in the project), so they arrive
+  // with the computer off. The phone subscribes to Web Push with the service's public key and posts its push address,
+  // followed players (id + name), alert switches and time zone to it. A push address only works with the service's
+  // private key, which never leaves the service.
+  const ALERTS = window.BASELINE_ALERTS || null;
   const ls = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } } };
   const deviceId = () => { let id = ls.get('baseline.device'); if (!id) { id = Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(16).padStart(2, '0')).join(''); ls.set('baseline.device', id); } return id; };
   const keyBytes = (s) => { const b = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4)); return Uint8Array.from(b, (c) => c.charCodeAt(0)); };
+  async function serviceKey() {
+    try { const r = await fetch(ALERTS + '/key', { cache: 'no-store' }); const j = await r.json(); if (j.key) { ls.set('baseline.alertsKey', j.key); return j.key; } } catch (e) { /* offline */ }
+    return ls.get('baseline.alertsKey');
+  }
+  const sameKey = (sub, key) => { try { return new Uint8Array(sub.options.applicationServerKey).join() === keyBytes(key).join(); } catch (e) { return false; } };
   const push = {
     standalone: () => !!(navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches)),
     ios: () => /iPhone|iPad|iPod/.test(navigator.userAgent),
-    supported: () => !!(RELAY && window.BASELINE_VAPID && 'serviceWorker' in navigator && 'PushManager' in window && typeof Notification !== 'undefined'),
+    supported: () => !!(ALERTS && 'serviceWorker' in navigator && 'PushManager' in window && typeof Notification !== 'undefined'),
     permission: () => (typeof Notification === 'undefined' ? 'unsupported' : Notification.permission),
     async subscription() { if (!push.supported()) return null; const reg = await navigator.serviceWorker.ready; return reg.pushManager.getSubscription(); },
-    // Must be called straight from a tap (iPhone only shows the permission prompt for a tap).
+    // true when alerts are allowed but this phone isn't yet subscribed to the current service (needs one tap on Turn on)
+    async needsTurnOn() {
+      if (!push.supported() || push.permission() !== 'granted') return false;
+      const sub = await push.subscription(); const key = await serviceKey();
+      return !sub || !!(key && !sameKey(sub, key));
+    },
+    // Must be called straight from a tap (iPhone only allows the permission prompt and subscribing from a tap).
     async enable(settings) {
       const perm = await Notification.requestPermission();
       if (perm !== 'granted') return perm;
+      const key = await serviceKey();
+      if (!key) throw new Error('the alerts service is unreachable');
       const reg = await navigator.serviceWorker.ready;
       let sub = await reg.pushManager.getSubscription();
-      if (sub && sub.options && sub.options.applicationServerKey) {
-        const k = new Uint8Array(sub.options.applicationServerKey);
-        if (k.join() !== keyBytes(window.BASELINE_VAPID).join()) { await sub.unsubscribe(); sub = null; } // the computer's key changed
-      }
-      if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(window.BASELINE_VAPID) });
+      if (sub && !sameKey(sub, key)) { await sub.unsubscribe(); sub = null; }
+      if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(key) });
       await push.sync(settings, { force: true });
       return 'granted';
     },
-    // Tell the computer about this phone. Skipped when nothing changed in the last 12 hours.
+    // Tell the service about this phone. Skipped when nothing changed in the last 12 hours. Returns the service's reply.
     async sync(settings, { force = false, test = false } = {}) {
-      if (!RELAY) return false;
+      if (!ALERTS) return null;
       let sub = null;
       try { if (push.permission() === 'granted') sub = await push.subscription(); } catch (e) { /* no service worker yet */ }
-      const msg = { v: 1, device: deviceId(), sub: sub ? sub.toJSON() : null, favs: settings.favs, notif: settings.notif, tz: settings.tz };
+      const msg = { v: 1, device: deviceId(), sub: sub ? sub.toJSON() : null, names: settings.names, notif: settings.notif, tz: settings.tz };
       const sig = JSON.stringify(msg);
       const last = Number(ls.get('baseline.syncedAt') || 0);
-      if (!force && !test && sig === ls.get('baseline.synced') && Date.now() - last < 12 * 3600e3) return false;
+      if (!force && !test && sig === ls.get('baseline.synced') && Date.now() - last < 12 * 3600e3) return null;
       if (test) msg.test = Date.now();
-      msg.at = new Date().toISOString();
-      const r = await fetch(RELAY, { method: 'POST', body: JSON.stringify(msg) });
-      if (!r.ok) throw new Error('relay ' + r.status);
+      const r = await fetch(ALERTS + '/settings', { method: 'POST', body: JSON.stringify(msg) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || 'alerts service ' + r.status);
       ls.set('baseline.synced', sig); ls.set('baseline.syncedAt', String(Date.now()));
-      return true;
+      return j;
     },
   };
 
