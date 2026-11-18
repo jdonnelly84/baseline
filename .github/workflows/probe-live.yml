@@ -1,15 +1,14 @@
 name: probe-live
 on:
   push:
-    paths: ['.github/workflows/probe-live.yml']
+    paths: ['.github/workflows/probe-live.yml', 'probe/live.mjs']
 jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Plain request to ATP's live feed (3 tries, 20 s apart)
-        run: |
-          for i in 1 2 3; do
-            node -e "fetch('https://app.atptour.com/api/v2/gateway/livematches/website?scoringTournamentLevel=tour',{headers:{'user-agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',accept:'application/json'}}).then(async r=>{const t=await r.text();console.log('node',r.status,t.length,t.slice(0,70))})"
-            curl -s -o /tmp/l.json -w "curl %{http_code} %{size_download}\n" -A "Mozilla/5.0" "https://app.atptour.com/api/v2/gateway/livematches/website?scoringTournamentLevel=tour"
-            sleep 20
-          done
+      - uses: actions/checkout@v4
+      - run: npm i --no-save playwright-core@1.49.1
+        working-directory: probe
+      - name: Real Chrome reading ATP's live feed
+        run: node live.mjs
+        working-directory: probe
