@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <title>Baseline</title>
 <meta name="theme-color" content="#1a1f6e">
+<meta name="color-scheme" content="dark light">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -14,7 +15,7 @@
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sofia+Sans+Condensed:wght@600;700;800&family=Sofia+Sans:wght@400;600;700;800&display=swap">
-<link rel="stylesheet" href="app.css?v=202611190256">
+<link rel="stylesheet" href="app.css?v=202611190557">
 </head>
 <body>
 <div id="flags"></div>
@@ -29,10 +30,36 @@
   
 </div>
 
-<script>window.BASELINE_DATA_URL = "https://raw.githubusercontent.com/jdonnelly84/baseline/data/data.json"; window.BASELINE_BUILD = "202611190256"; window.BASELINE_ALERTS = "https://baseline-alerts.jdonnelly84.workers.dev";</script>
-<script src="pwa-loader.js?v=202611190256"></script>
-<script src="app.js?v=202611190256"></script>
+<script>window.BASELINE_DATA_URL = "https://raw.githubusercontent.com/jdonnelly84/baseline/data/data.json"; window.BASELINE_BUILD = "202611190557"; window.BASELINE_ALERTS = "https://baseline-alerts.jdonnelly84.workers.dev";</script>
+<script src="pwa-loader.js?v=202611190557"></script>
+<script src="app.js?v=202611190557"></script>
 <script>
+// Android (Chrome, Samsung Internet): offer to install Baseline as an app with one tap. Chrome hands the page an
+// install prompt; where a browser doesn't, show where its own menu option is.
+(function () {
+  if (!/Android/i.test(navigator.userAgent) || matchMedia('(display-mode: standalone)').matches) return;
+  try { if (localStorage.getItem('baseline.installHint') === 'no') return; } catch (e) {}
+  var prompt = null, box = null;
+  function close(forGood) { if (box) box.remove(); box = null; if (forGood) try { localStorage.setItem('baseline.installHint', 'no'); } catch (e) {} }
+  function show(html, withButton) {
+    close(false);
+    box = document.createElement('div');
+    box.setAttribute('style', 'position:fixed;left:10px;right:10px;bottom:calc(env(safe-area-inset-bottom,0px) + 74px);z-index:50;background:#1a1f6e;color:#fff;border-radius:16px;padding:14px 44px 14px 14px;font:15px/1.4 system-ui,sans-serif;box-shadow:0 8px 30px rgba(0,0,0,.4)');
+    box.innerHTML = html + (withButton ? '<div style="margin-top:10px"><button data-install style="background:#fff;color:#1a1f6e;border:0;border-radius:10px;padding:10px 18px;font:700 15px system-ui,sans-serif">Install Baseline</button></div>' : '') +
+      '<button aria-label="Close" data-x style="position:absolute;top:6px;right:8px;background:none;border:0;color:#fff;font-size:24px;line-height:1;padding:6px">&times;</button>';
+    box.querySelector('[data-x]').onclick = function () { close(true); };
+    var b = box.querySelector('[data-install]');
+    if (b) b.onclick = function () { if (!prompt) return; prompt.prompt(); prompt.userChoice.then(function (c) { if (c && c.outcome === 'accepted') close(true); }); prompt = null; };
+    document.body.appendChild(box);
+  }
+  window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); prompt = e; show('<b>Get Baseline as an app</b><br>It opens full-screen from your home screen and can send you alerts for your players.', true); });
+  window.addEventListener('appinstalled', function () { close(true); });
+  setTimeout(function () {
+    if (prompt || box) return;
+    var samsung = /SamsungBrowser/i.test(navigator.userAgent);
+    show('<b>Get Baseline as an app</b><br>' + (samsung ? 'Tap the menu button (&#9776;) at the bottom, then <b>Add page to</b> &rarr; <b>Home screen</b>.' : 'Tap the menu (&#8942;) at the top right, then <b>Add to home screen</b> &rarr; <b>Install</b>.'), false);
+  }, 3500);
+})();
 // Opened in Safari on an iPhone rather than from a Home Screen web app: explain how to add it properly.
 (function () {
   var ios = /iPhone|iPad|iPod/.test(navigator.userAgent);

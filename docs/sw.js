@@ -1,6 +1,6 @@
 // Keeps the app opening offline. Always tries the network first, so a new version shows up on the next launch.
-const CACHE = 'baseline-202611190256';
-const SHELL = ['./', 'app.css?v=202611190256', 'app.js?v=202611190256', 'pwa-loader.js?v=202611190256', 'manifest.webmanifest', 'icon-180.png'];
+const CACHE = 'baseline-202611190557';
+const SHELL = ['./', 'app.css?v=202611190557', 'app.js?v=202611190557', 'pwa-loader.js?v=202611190557', 'manifest.webmanifest', 'icon-180.png'];
 self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', (e) => e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim())));
 self.addEventListener('fetch', (e) => {
@@ -14,7 +14,7 @@ self.addEventListener('fetch', (e) => {
 self.addEventListener('push', (e) => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (err) { d = { body: e.data ? e.data.text() : '' }; }
-  e.waitUntil(self.registration.showNotification(d.title || 'Baseline', { body: d.body || '', tag: d.tag || undefined, icon: 'icon-192.png', badge: 'icon-192.png', data: { url: './' } }));
+  e.waitUntil(self.registration.showNotification(d.title || 'Baseline', { body: d.body || '', tag: d.tag || undefined, icon: 'icon-192.png', badge: 'badge-96.png', data: { url: './' } }));
 });
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
