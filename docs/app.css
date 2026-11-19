@@ -439,6 +439,6 @@ body { position: fixed; top: 0; left: 0; right: 0; height: 100%; }
 :root { --a125: #8fa6c4; }
 .cat.a125 { background: var(--a125); }
 /* the WTA side gets its own header colours so it's always clear which tour is on screen */
-:root[data-tour="wta"] { --head-a: #3b0f4f; --head-b: #b0287a; }
-@media (prefers-color-scheme: light) { :root[data-tour="wta"]:not([data-theme="dark"]) { --head-a: #4a1263; --head-b: #c4307f; } }
-:root[data-tour="wta"][data-theme="light"] { --head-a: #4a1263; --head-b: #c4307f; }
+:root[data-tourview="wta"] { --head-a: #3b0f4f; --head-b: #b0287a; }
+@media (prefers-color-scheme: light) { :root[data-tourview="wta"]:not([data-theme="dark"]) { --head-a: #4a1263; --head-b: #c4307f; } }
+:root[data-tourview="wta"][data-theme="light"] { --head-a: #4a1263; --head-b: #c4307f; }

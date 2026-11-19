@@ -20,7 +20,8 @@
     rkKind: 'singles', rkList: 'sgl', rkQuery: '',
     drawType: 'sgl', drawRound: null, drawQuery: '', resType: 'sgl',
     resDay: 0, schedDay: null, pastRound: null, // tournament screens: chosen results day, schedule day, past-event round
-    espn: {},                         // ESPN lookups for past events and last year's editions: { 'tid:year': {loading|error|ev} }
+    espn: {},
+    entry: {},                        // WTA entry lists: { 'tid:year': list | false }                         // ESPN lookups for past events and last year's editions: { 'tid:year': {loading|error|ev} }
     favs: store.get('favs', ['S0AG', 'A0E2']),
     notif: store.get('notif', { start: true, sets: false, result: true, schedule: true }),
     tz: store.get('tz', null),
@@ -472,9 +473,9 @@
   }
   // The draw: WTA numbers main-draw matches like a family tree (the final is 1, its two semis 2 and 3, match n is fed
   // by 2n and 2n+1), so the bracket order, byes and each player's path come straight from the numbers.
-  function wtaDraw(list, dbl) {
+  function wtaDraw(list, dbl, finals = false) {
     const by = new Map();
-    list.forEach((x) => { if (wtaMain(x.raw) && x.doubles === dbl) by.set(wtaNum(x.raw), x); });
+    list.forEach((x) => { if (wtaMain(x.raw) && x.doubles === dbl && (!finals || wtaNum(x.raw) < 4)) by.set(wtaNum(x.raw), x); });
     if (!by.size) return null;
     const levels = Math.floor(Math.log2(Math.max(...by.keys()))) + 1;
     const tba = () => ({ players: [], seed: null, entry: null, sets: [], won: false });
@@ -508,8 +509,28 @@
   const isoDayIn = (utc) => new Date(utc).toLocaleDateString('en-CA', { timeZone: tz() });
   const longDay = (iso) => dateFrom(iso).toLocaleDateString('en-NZ', { weekday: 'short', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
   // One tournament's matches → results by day, order of play, draws and the live scores
+  // Round-robin groups (WTA Finals): players who meet in the group stage form a group; ordered by wins, then sets.
+  function wtaGroups(rr, dbl) {
+    const key = (tm) => tm.players.map((p) => p.id || p.name).sort().join('|');
+    const team = new Map(), link = new Map();
+    const find = (k) => { while (link.get(k) !== k) k = link.get(k); return k; };
+    for (const x of rr) for (const tm of [x.a, x.b]) { const k = key(tm); if (!team.has(k)) { team.set(k, { players: tm.players, seed: tm.seed, w: 0, l: 0, sw: 0, sl: 0 }); link.set(k, k); } }
+    for (const x of rr) {
+      const ka = key(x.a), kb = key(x.b); link.set(find(ka), find(kb));
+      if (x.winner == null) continue;
+      const A = team.get(ka), B = team.get(kb); const [w, l] = x.winner === 0 ? [A, B] : [B, A]; w.w++; l.l++;
+      x.a.sets.forEach((st, i) => { const o = x.b.sets[i]; if (!o) return; if (st.g > o.g) { A.sw++; B.sl++; } else if (o.g > st.g) { B.sw++; A.sl++; } });
+    }
+    const groups = {};
+    for (const k of team.keys()) (groups[find(k)] ||= []).push(team.get(k));
+    return Object.values(groups).sort((a, b) => Math.min(...a.map((t) => t.seed || 99)) - Math.min(...b.map((t) => t.seed || 99)))
+      .map((ts, i) => ({ name: `${dbl ? 'Doubles group' : 'Group'} ${'ABCD'[i] || i + 1}`, doubles: dbl,
+        rows: ts.sort((a, b) => b.w - a.w || (b.sw - b.sl) - (a.sw - a.sl) || (a.seed || 99) - (b.seed || 99)).map((t, j) => ({ pos: j + 1, players: t.players, matches: t.w + t.l ? `${t.w}-${t.l}` : null, sets: t.w + t.l ? `${t.sw}-${t.sl}` : null })) }));
+  }
   function wtaEvent(t, json) {
     const list = ((json && json.matches) || []).filter((m) => m.MatchID && (m.PlayerNameLastA || m.PlayerIDA)).map(wtaMatch);
+    const finals = t.type === 'WC';
+    if (finals) list.forEach((x) => { if (wtaMain(x.raw) && wtaNum(x.raw) >= 4) x.round = 'Round Robin'; });
     const results = (dbl) => {
       const byDay = {};
       list.filter((x) => x.doubles === dbl && x.state === 'finished').forEach((x) => { const k = x.utc ? isoDayIn(x.utc) : '0'; (byDay[k] ||= []).push(x); });
@@ -529,7 +550,9 @@
       id: x.id, round: x.round, court: x.court, doubles: x.doubles, status: x.state === 'live' ? 'live' : 'suspended', rawStatus: x.raw.MatchState,
       server: x.serve === 'A' ? 1 : x.serve === 'B' ? 2 : null, duration: x.duration, message: '', updated: x.raw.LastUpdated, winner: null, umpire: '',
       a: { ...x.a, game: x.game[0] }, b: { ...x.b, game: x.game[1] } }));
-    return { event: { results: results(false), resultsDbl: results(true), schedule, draws: wtaDraw(list, false), drawsDbl: wtaDraw(list, true), groups: [] },
+    const rr = finals ? list.filter((x) => x.round === 'Round Robin') : [];
+    const groups = finals ? [...wtaGroups(rr.filter((x) => !x.doubles), false), ...wtaGroups(rr.filter((x) => x.doubles), true)] : [];
+    return { event: { results: results(false), resultsDbl: results(true), schedule, draws: wtaDraw(list, false, finals), drawsDbl: wtaDraw(list, true, finals), groups },
       live: live.length ? { id: t.id, title: t.name, city: t.city, matches: live } : null, list };
   }
   const wtaRows = (arr) => (Array.isArray(arr) ? arr : (arr && arr.content) || []).map((r) => {
@@ -537,6 +560,91 @@
     return { rank: r.ranking, players: [{ id: 'W' + p.id, name: p.fullName, country: p.countryCode }], age: dob ? String(Math.floor((Date.now() - dob) / 31557600000)) : null,
       points: r.points, pointsMove: null, tourns: r.tournamentsPlayed ?? null, dropping: null, nextBest: null, next: null, max: null, current: null, rankMove: r.movement || null, at: r.rankedAt };
   });
+  // WTA ranking points by round reached (main draw), used to estimate the live rankings, as live-ranking sites do:
+  // official points + what each player has earned at this week's events − what they earned at the same events last year.
+  const WTA_PTS = {
+    GS: { W: 2000, F: 1300, SF: 780, QF: 430, R16: 240, R32: 130, R64: 70, R128: 10 },
+    M96: { W: 1000, F: 650, SF: 390, QF: 215, R16: 120, R32: 65, R64: 35, R128: 10 },
+    M56: { W: 1000, F: 650, SF: 390, QF: 215, R16: 120, R32: 65, R64: 10 },
+    P48: { W: 500, F: 325, SF: 195, QF: 108, R16: 60, R32: 32, R64: 1 },
+    P28: { W: 500, F: 325, SF: 195, QF: 108, R16: 60, R32: 1 },
+    I32: { W: 250, F: 163, SF: 98, QF: 54, R16: 30, R32: 1 },
+    C32: { W: 160, F: 95, SF: 57, QF: 29, R16: 15, R32: 1 },
+  };
+  const WTA_PTS_D = { GS: { W: 2000, F: 1300, SF: 780, QF: 430, R16: 240, R32: 130, R64: 10 }, 1000: { W: 1000, F: 650, SF: 390, QF: 215, R16: 120, R32: 10 }, 500: { W: 500, F: 325, SF: 195, QF: 108, R16: 1 }, 250: { W: 250, F: 163, SF: 98, QF: 54, R16: 1 }, 125: { W: 160, F: 95, SF: 57, QF: 29, R16: 1 } };
+  const roundKey = (r) => ({ Final: 'F', 'Semi-Finals': 'SF', 'Quarter-Finals': 'QF' }[r] || ((r || '').match(/Round of (\d+)/) ? 'R' + r.match(/Round of (\d+)/)[1] : null));
+  const NEXT_ROUND = { R128: 'R64', R64: 'R32', R32: 'R16', R16: 'QF', QF: 'SF', SF: 'F', F: 'W' };
+  const ROUND_WORD = { W: 'champion', F: 'final', SF: 'semis', QF: 'quarters', R16: 'R16', R32: 'R32', R64: 'R64', R128: 'R128' };
+  function wtaTable(t, dbl) {
+    if (dbl) return WTA_PTS_D[t.type] || null;
+    return t.type === 'GS' ? WTA_PTS.GS : t.type === '1000' ? ((t.sgl || 96) > 64 ? WTA_PTS.M96 : WTA_PTS.M56) : t.type === '500' ? ((t.sgl || 28) > 32 ? WTA_PTS.P48 : WTA_PTS.P28)
+      : t.type === '250' ? WTA_PTS.I32 : t.type === '125' ? WTA_PTS.C32 : null;
+  }
+  // Points each player has from one event so far: the round they've reached (a player still in has at least the next round's points).
+  function wtaEventPoints(t, list, dbl) {
+    const out = new Map();
+    if (t.type === 'WC') { // Finals: 200 a group win, 400 for winning the semi, 500 for the final
+      for (const x of list) {
+        if (x.doubles !== dbl || x.winner == null || !wtaMain(x.raw)) continue;
+        const n = wtaNum(x.raw); const pts = n === 1 ? 500 : n < 4 ? 400 : 200;
+        (x.winner === 0 ? x.a : x.b).players.forEach((p) => { if (p.id) { const o = out.get(p.id) || { pts: 0, round: 'RR' }; o.pts += pts; if (n === 1) o.round = 'W'; out.set(p.id, o); } });
+        (x.winner === 0 ? x.b : x.a).players.forEach((p) => { if (p.id && !out.has(p.id)) out.set(p.id, { pts: 0, round: 'RR', out: n < 4 }); });
+      }
+      return out;
+    }
+    const tbl = wtaTable(t, dbl); if (!tbl) return out;
+    const best = new Map();
+    for (const x of list) {
+      if (x.doubles !== dbl || !wtaMain(x.raw) || x.state === 'scheduled') continue;
+      const k = roundKey(x.round); if (!k) continue; const lvl = wtaNum(x.raw);
+      [[x.a, 0], [x.b, 1]].forEach(([tm, side]) => tm.players.forEach((p) => { if (!p.id) return; const b = best.get(p.id); if (b && b.lvl <= lvl) return; best.set(p.id, { lvl, k, done: x.winner != null, won: x.winner === side }); }));
+    }
+    for (const [id, b] of best) { const key = b.done && b.won ? NEXT_ROUND[b.k] : b.k; out.set(id, { pts: tbl[key] ?? 0, round: key, out: b.done && !b.won }); }
+    return out;
+  }
+  function wtaLiveList(R, current, dbl) {
+    const base = (R && R.rows) || []; const delta = new Map(), drop = new Map(), note = new Map();
+    for (const c of current) {
+      const now = wtaEventPoints(c.t, c.list, dbl), before = c.last ? wtaEventPoints(c.t, c.last, dbl) : new Map();
+      for (const [id, v] of now) { delta.set(id, (delta.get(id) || 0) + v.pts); note.set(id, v.round === 'W' ? `${c.t.city} champion` : v.out ? `Out in the ${ROUND_WORD[v.round] || 'group'} · ${c.t.city}` : `${c.t.city} · ${ROUND_WORD[v.round] || 'group stage'}`); }
+      for (const [id, v] of before) { delta.set(id, (delta.get(id) || 0) - v.pts); drop.set(id, (drop.get(id) || 0) + v.pts); }
+    }
+    const rows = base.map((r) => { const id = r.players[0].id; const d = delta.get(id) || 0; return { ...r, official: r.points, officialRank: r.rank, points: r.points + d, pointsMove: d || null, current: note.get(id) || null, dropping: drop.get(id) || null }; })
+      .sort((a, b) => b.points - a.points || a.officialRank - b.officialRank);
+    rows.forEach((r, i) => { r.rank = i + 1; r.rankMove = r.officialRank - r.rank || null; });
+    return { asOf: R && R.asOf, rows, estimated: true, drop };
+  }
+  // Who's likely to play upcoming events, until the WTA publishes the entry list (then the Field tab shows that instead).
+  const WTA_DIRECT = { 128: 104, 96: 76, 64: 48, 56: 44, 48: 36, 32: 22, 30: 22, 28: 20 };
+  function wtaProjections(upcoming, sgl, race, hist) {
+    const out = {}; const ranked = ((sgl && sgl.rows) || []).filter((r) => r.players[0] && r.players[0].id);
+    const overlap = (a, b) => a.start <= b.end && b.start <= a.end;
+    for (const t of upcoming) {
+      if (t.type === 'WC') out[t.id] = { basis: 'The top 8 in the Race to the WTA Finals qualify. Places 9 and 10 are the alternates.', players: ((race && race.rows) || []).slice(0, 10).map((r, i) => ({ id: r.players[0].id, rank: r.rank, points: r.points, status: i < 8 ? 'in' : 'alt' })) };
+      else if (t.type === 'GS' || t.type === '1000') { const n = WTA_DIRECT[t.sgl] || 48; out[t.id] = { basis: `Mandatory event for top players. The top ${n} or so get in on ranking.`, cutoff: ranked[n - 1]?.rank, players: ranked.slice(0, n).map((r) => ({ id: r.players[0].id, rank: r.rank, status: 'expected' })) }; }
+    }
+    const small = upcoming.filter((t) => ['500', '250', '125'].includes(t.type)); const done = new Set();
+    for (const t of small) {
+      if (done.has(t.id)) continue;
+      const group = small.filter((x) => overlap(x, t)); group.forEach((g) => done.add(g.id));
+      const busy = new Set(); upcoming.forEach((x) => { if ((x.type === '1000' || x.type === 'GS') && group.some((g) => overlap(g, x)) && out[x.id]) out[x.id].players.forEach((p) => busy.add(p.id)); });
+      const slots = Object.fromEntries(group.map((g) => [g.id, WTA_DIRECT[g.sgl] || 22])); const lists = Object.fromEntries(group.map((g) => [g.id, []]));
+      const tier = { 500: 0, 250: 1, 125: 2 };
+      for (const r of ranked) {
+        const id = r.players[0].id; if (busy.has(id)) continue;
+        let pick = group.find((g) => hist[g.id] && hist[g.id].has(id) && lists[g.id].length < slots[g.id]); let status = pick ? 'likely' : 'possible';
+        if (!pick) {
+          const open = group.filter((g) => lists[g.id].length < slots[g.id] && !(g.type === '125' && r.rank <= 60) && !(g.type === '250' && r.rank <= 12));
+          if (!open.length) continue;
+          open.sort((a, b) => tier[a.type] - tier[b.type] || (slots[b.id] - lists[b.id].length) - (slots[a.id] - lists[a.id].length)); pick = open[0];
+        }
+        lists[pick.id].push({ id, rank: r.rank, status });
+        if (group.every((g) => lists[g.id].length >= slots[g.id])) break;
+      }
+      for (const g of group) { const others = group.filter((x) => x.id !== g.id).map((x) => x.city); out[g.id] = { basis: `Based on the rankings${others.length ? ` and a split with ${others.join(' and ')} the same week` : ''}. Players who played here last year are marked likely.`, cutoff: lists[g.id][lists[g.id].length - 1]?.rank, players: lists[g.id] }; }
+    }
+    return out;
+  }
   const wtaCurrent = (t) => { const now = Date.now(); return t.start && t.type !== 'UC' && dateFrom(t.start) - now < 1.5 * 864e5 && now - dateFrom(t.end) < 1.5 * 864e5; };
   // Everything the WTA side shows, built on the phone. matchesOnly: just re-read this week's tournaments (live scores).
   async function loadWta(prev, { matchesOnly = false } = {}) {
@@ -558,17 +666,50 @@
       const players = {};
       const add = (p, k, rank) => { if (!p.id) return; const o = players[p.id] || (players[p.id] = { id: p.id, name: p.name, country: p.country, short: p.name ? p.name.split(' ')[0][0] + '. ' + p.name.split(' ').slice(1).join(' ') : p.name }); if (k) o[k] = rank; };
       sgl.forEach((r) => add(r.players[0], 'rank', r.rank)); dbl.forEach((r) => add(r.players[0], 'dblRank', r.rank));
+      // the races to the WTA Finals (singles players, doubles teams)
+      const [r0, r1, rd] = await Promise.all([`${base}/race/singles?page=0`, `${base}/race/singles?page=1`, `${base}/race/doubles?page=0`].map((u) => espnJson(u, 3 * 3600e3).catch(() => [])));
+      const race = wtaRows([...(r0 || []), ...(r1 || [])]);
+      const teamRace = (Array.isArray(rd) ? rd : []).map((r) => ({ rank: r.ranking, players: [r.player1, r.player2].filter(Boolean).map((p) => ({ id: 'W' + p.id, name: p.fullName, country: p.countryCode })), points: r.points, tourns: r.tournamentsPlayed ?? null, rankMove: r.movement || null, pointsMove: null }));
+      race.forEach((r) => add(r.players[0])); teamRace.forEach((r) => r.players.forEach((p) => add(p)));
+      // defending champions: last season's winners
+      const champions = {};
+      try {
+        const last = await Promise.all([0, 1].map((p) => espnJson(`${base}/tournaments?page=${p}&from=${yr - 1}-01-01&to=${yr - 1}-12-31`, 7 * 864e5).catch(() => null)));
+        last.flatMap((x) => (x && x.content) || []).forEach((t) => { const w = (t.winners || []).find((x) => x && x.singles && x.singles.player); const gid = t.tournamentGroup && t.tournamentGroup.id; if (w && gid) { const pl = w.singles.player; champions[String(gid)] = 'W' + pl.id; add({ id: 'W' + pl.id, name: pl.fullName, country: pl.countryCode }); } });
+      } catch (e) { /* no champions shown */ }
       W = { source: 'live', tour: 'wta', generatedAt: new Date().toISOString(), tournaments, live: {}, events: {}, players,
-        rankings: { sgl: { asOf, rows: sgl }, dbl: { asOf, rows: dbl } }, news, projections: {}, champions: {}, lastYear: {}, flagsSvg: (DA && DA.flagsSvg) || '' };
+        rankings: { sgl: { asOf, rows: sgl }, dbl: { asOf, rows: dbl }, sgl_race: { asOf, rows: race }, dbl_race: { asOf, rows: teamRace } },
+        news, projections: {}, champions, lastYear: {}, flagsSvg: (DA && DA.flagsSvg) || '' };
+      // projected fields for the next four weeks, using who played each event last year
+      const today = new Date().toISOString().slice(0, 10);
+      const upcoming = tournaments.filter((t) => t.start > today && dateFrom(t.start) - Date.now() < 28 * 864e5 && ['GS', '1000', '500', '250', '125', 'WC'].includes(t.type));
+      const hist = {};
+      for (const t of upcoming.filter((x) => ['500', '250', '125'].includes(x.type))) {
+        try { const l = await loadWtaPast(t, t.year - 1, true); hist[t.id] = new Set(l.filter((x) => !x.doubles).flatMap((x) => [...x.a.players, ...x.b.players].map((p) => p.id)).filter(Boolean)); W.lastYear[t.id] = [...hist[t.id]]; } catch (e) { /* projection without it */ }
+      }
+      W.projections = wtaProjections(upcoming, W.rankings.sgl, W.rankings.sgl_race, hist);
     }
+    if (matchesOnly && prev) W.rankings = { ...prev.rankings };
+    const current = [];
     for (const t of W.tournaments.filter(wtaCurrent)) {
       try {
         const j = await espnJson(`${base}/matches/${t.id}/${t.year}`, 15e3);
         const { event, live, list } = wtaEvent(t, j);
         if (list.length) W.events[t.id] = event;
         if (live) W.live[t.id] = live;
+        let last = null; try { last = await loadWtaPast(t, t.year - 1, true); } catch (e) { /* no drop-offs known */ }
+        current.push({ t, list, last });
         list.forEach((x) => [x.a, x.b].forEach((tm) => tm.players.forEach((p) => { if (p.id && !W.players[p.id]) W.players[p.id] = { id: p.id, name: p.name, country: p.country, short: p.name.split(' ')[0][0] + '. ' + p.name.split(' ').slice(1).join(' ') }; })));
       } catch (e) { /* keep what we had for this event */ if (prev && prev.events[t.id]) W.events[t.id] = prev.events[t.id]; }
+    }
+    // live rankings (estimated) from this week's results
+    if (W.rankings.sgl) {
+      const ls = wtaLiveList(W.rankings.sgl, current, false), ld = wtaLiveList(W.rankings.dbl, current, true);
+      W.rankings.sgl_live = ls; W.rankings.dbl_live = ld;
+      // the official lists show what each player is defending this week
+      W.rankings.sgl = { ...W.rankings.sgl, rows: W.rankings.sgl.rows.map((r) => ({ ...r, dropping: ls.drop.get(r.players[0].id) || null })) };
+      W.rankings.dbl = { ...W.rankings.dbl, rows: W.rankings.dbl.rows.map((r) => ({ ...r, dropping: ld.drop.get(r.players[0].id) || null })) };
+      delete ls.drop; delete ld.drop;
     }
     W.generatedAt = new Date().toISOString();
     if (!matchesOnly) wtaPhotos(W);
@@ -636,7 +777,7 @@
   function render() {
     D = (S.tour === 'wta' ? DW : DA) || DA || D;
     if (S.tour === 'wta' && !DW) S._wtaWaiting = true;
-    document.documentElement.dataset.tour = S.tour === 'wta' && DW ? 'wta' : 'atp';
+    document.documentElement.dataset.tourview = S.tour === 'wta' && DW ? 'wta' : 'atp';
     const scr = $('#screen'); const keep = scr && S._keepScroll ? scr.scrollTop : 0;
     applyTheme();
     let head = '', body = '';
@@ -716,7 +857,7 @@
     const espnOk = !['UC', 'DCR', 'LVR', 'BJK'].includes(t.type) && !!t.start;
     const subs = hasEvent ? [['live', 'Live'], ['results', 'Results'], ['schedule', 'Schedule'], ['draw', 'Draws'], ['about', 'About']]
       : st === 'past' ? [...(espnOk ? [['past', 'Results']] : []), ['about', 'Overview']]
-      : [['about', 'Overview'], ...(D.tour === 'wta' ? [] : [['field', t.type === 'WC' || t.type === 'XXI' ? 'Qualifying' : 'Projected field']]), ...(espnOk ? [['lastyear', `${year - 1} results`]] : [])];
+      : [['about', 'Overview'], ['field', t.type === 'WC' || t.type === 'XXI' ? 'Qualifying' : D.tour === 'wta' ? 'Field' : 'Projected field'], ...(espnOk ? [['lastyear', `${year - 1} results`]] : [])];
     if (!v.sub || !subs.some(([k]) => k === v.sub)) v.sub = subs[0][0];
     const head = `<div class="top-row"><button class="back" data-back>${ICON.back}<span>Back</span></button><span style="flex:1"></span><span class="cat ${catClass(t.type)}">${catLabel(t.type)}</span></div>
       <div class="top-row" style="margin-top:6px"><h1>${esc(t.city)}</h1></div>
@@ -756,7 +897,7 @@
     } else if (v.sub === 'about') {
       body = aboutView(t, hasEvent);
     } else if (v.sub === 'field') {
-      body = fieldView(t);
+      body = D.tour === 'wta' && t.type !== 'WC' ? wtaFieldView(t) : fieldView(t);
     }
     return { head, body: `<div class="pad">${body}</div>` };
   }
@@ -817,6 +958,26 @@
       ${t.site ? `<a class="btn ghost" href="${esc(t.site)}" target="_blank" rel="noopener">${ICON.ext} Tournament website</a>` : ''}`;
   }
 
+  function wtaFieldView(t) {
+    const key = t.id + ':' + t.year; const E = S.entry[key];
+    if (E === undefined) {
+      S.entry[key] = null;
+      espnJson(`${SERVICE()}/wta/players/${t.id}/${t.year}`, 3 * 3600e3).then((j) => { S.entry[key] = ((j && j.events) || []).find((e) => e.eventTypeCode === 'LS' && (e.eventPlayers || []).length) || false; S._keepScroll = true; render(); })
+        .catch(() => { S.entry[key] = false; S._keepScroll = true; render(); });
+    }
+    if (E === null || E === undefined) return '<div class="empty">Loading the entry list…</div>';
+    if (!E) return `<p class="note" style="margin:0">The WTA hasn’t published the entry list yet, so this is a projection.</p>${fieldView(t)}`;
+    const last = new Set(D.lastYear[t.id] || []); const champ = D.champions[t.id];
+    const ENTRY = { M: '', Q: 'Qualifier', WC: 'Wildcard', Wc: 'Wildcard', PR: 'Protected', SE: 'Special exempt', Alt: 'Alternate', ALT: 'Alternate', LL: 'Lucky loser' };
+    const rows = E.eventPlayers.map((e) => { const pl = (e.players || [])[0] || {}; const id = 'W' + pl.id; const p = player(id) || { id, name: titleCase(pl.fullName || ''), country: pl.countryCode }; return { id, p, seed: /^\d+$/.test(e.seed || '') ? +e.seed : null, entry: ENTRY[e.entryType] ?? e.entryType, rank: player(id)?.rank || null, out: e.eliminated }; })
+      .sort((a, b) => (a.seed || 999) - (b.seed || 999) || (a.rank || 9999) - (b.rank || 9999));
+    const favIn = rows.filter((r) => isFav(r.id));
+    return `<p class="note" style="margin:0">The WTA’s entry list for the main draw. Seeds appear once the draw is made.</p>
+      <div class="facts"><div><span class="eyebrow">Players entered</span><b>${rows.length}</b></div><div><span class="eyebrow">Players you follow</span><b>${favIn.length ? favIn.map((r) => esc(pname(r.p).split(' ').pop())).join(', ') : 'None entered'}</b></div></div>
+      <div class="list">${rows.map((r) => `<button class="rk-row ${isFav(r.id) ? 'fav' : ''}" data-player="${esc(r.id)}"><span class="n num">${r.rank || '–'}</span>
+        <span class="p">${avatar(r.p)}<span style="min-width:0"><div class="pn">${flag(r.p.country)} ${esc(pname(r.p))}</div><div class="pm">${champ === r.id ? '<span class="crown">Defending champion</span> · ' : ''}${[r.seed ? 'Seed ' + r.seed : '', r.entry, last.has(r.id) ? 'Played here last year' : ''].filter(Boolean).join(' · ') || 'Main draw'}</div></span></span>
+        <span class="status-chip ${r.entry ? 'likely' : 'in'}">${r.entry ? esc(r.entry) : 'In'}</span></button>`).join('')}</div>`;
+  }
   function fieldView(t) {
     const pr = D.projections[t.id];
     if (!pr) return '<div class="empty">No projection for this event yet. Projections appear once it is within the next few weeks.</div>';
@@ -883,7 +1044,7 @@
     singles: [['sgl', 'Official'], ['sgl_live', 'Live'], ['sgl_race', 'Race to Turin'], ['nextgen', 'Next Gen race']],
     doubles: [['dbl', 'Official'], ['dbl_live', 'Live'], ['dbl_race', 'Team race']],
   };
-  const RKW = { singles: [['sgl', 'Singles']], doubles: [['dbl', 'Doubles']] }; // the WTA publishes no live or race lists to read
+  const RKW = { singles: [['sgl', 'Official'], ['sgl_live', 'Live'], ['sgl_race', 'Race to the Finals']], doubles: [['dbl', 'Official'], ['dbl_live', 'Live'], ['dbl_race', 'Team race']] };
   function viewRankings() {
     const lists = (D.tour === 'wta' ? RKW : RK)[S.rkKind];
     if (!lists.some(([k]) => k === S.rkList)) S.rkList = lists[0][0];
@@ -901,7 +1062,7 @@
     const body = `<div class="pad" style="gap:12px">
       <div class="seg">${[['singles', 'Singles'], ['doubles', 'Doubles']].map(([k, l]) => `<button data-rkkind="${k}" class="${S.rkKind === k ? 'on' : ''}">${l}</button>`).join('')}</div>
       <div class="search">${ICON.search}<input id="rkq" placeholder="Search players" value="${esc(S.rkQuery)}" autocomplete="off"></div>
-      ${S.rkList === 'sgl_race' ? '<p class="note" style="margin:0">The top 8 at the end of the season qualify for the Nitto ATP Finals in Turin.</p>' : S.rkList === 'nextgen' ? '<p class="note" style="margin:0">Players 21 and under. The top 7 qualify for the Next Gen ATP Finals.</p>' : S.rkList.endsWith('_live') ? '<p class="note" style="margin:0">Live rankings include points won and dropped this week.</p>' : '<p class="note" style="margin:0">Tap a player for their points, movement and who’s around them.</p>'}
+      ${S.rkList === 'sgl_race' ? `<p class="note" style="margin:0">The top 8 at the end of the season qualify for the ${D.tour === 'wta' ? 'WTA Finals' : 'Nitto ATP Finals in Turin'}.</p>` : S.rkList.endsWith('_live') && D.tour === 'wta' ? '<p class="note" style="margin:0">The WTA doesn’t publish live rankings, so Baseline works them out the way live-ranking sites do: official points, plus what each player has earned this week, minus what they earned at the same events last year. Treat them as close estimates.</p>' : S.rkList === 'dbl_race' && D.tour === 'wta' ? '<p class="note" style="margin:0">The top 8 teams at the end of the season qualify for the WTA Finals.</p>' : S.rkList === 'nextgen' ? '<p class="note" style="margin:0">Players 21 and under. The top 7 qualify for the Next Gen ATP Finals.</p>' : S.rkList.endsWith('_live') ? '<p class="note" style="margin:0">Live rankings include points won and dropped this week.</p>' : '<p class="note" style="margin:0">Tap a player for their points, movement and who’s around them.</p>'}
       <div class="list rk">${rows.map((r, i) => {
         const fav = r.players.some((p) => isFav(p.id));
         const mv = r.rankMove; const move = mv ? `<span class="mv ${mv > 0 ? 'up' : 'down'}">${mv > 0 ? '▲' : '▼'}${Math.abs(mv)}</span>` : '';
@@ -974,7 +1135,7 @@
           <div class="toggle-row"><div class="lbl"><b>Appearance</b></div><div class="seg" style="min-width:210px">${[['system', 'Auto'], ['dark', 'Dark'], ['light', 'Light']].map(([k, l]) => `<button data-theme-set="${k}" class="${S.theme === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
           <div class="toggle-row"><div class="lbl"><b>Top spacing</b><small>If the top of Baseline sits under the clock or camera, pick More</small></div><div class="seg" style="min-width:190px">${[['auto', 'Auto'], ['on', 'More'], ['off', 'Less']].map(([k, l]) => `<button data-topfix="${k}" class="${S.topFix === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
           <div class="toggle-row"><div class="lbl"><b>This screen</b><small>${esc([SCREEN.model ? SCREEN.model + ' size' : null, SCREEN.size, 'layout ' + (document.documentElement.dataset.size || '?'), 'top ' + SCREEN.top + (SCREEN.fallback ? ' (fixed)' : ''), SCREEN.standalone ? 'Home Screen app' : 'in browser'].filter(Boolean).join(' · '))}</small></div></div>
-          <div class="toggle-row"><div class="lbl"><b>Data</b><small>${D.source === 'snapshot' ? 'Preview snapshot taken ' + esc(new Date(D.generatedAt).toLocaleString('en-NZ', { timeZone: tz(), day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })) + '. The installed app refreshes live.' : (D.dataAt ? 'Live scores straight from ATP every 20 s. Draws, order of play, results and rankings from the updater on your computer, last refreshed ' + esc(ago(D.dataAt)) + '.' : 'Live from atptour.com · scores every 20 s, everything else every 5 min')}</small></div></div>
+          <div class="toggle-row"><div class="lbl"><b>Data</b><small>${D.source === 'snapshot' ? 'Preview snapshot taken ' + esc(new Date(D.generatedAt).toLocaleString('en-NZ', { timeZone: tz(), day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })) + '. The installed app refreshes live.' : (D.dataAt ? 'ATP: live scores straight from ATP every 20 s; draws, order of play, results and rankings from the updater on your computer, last refreshed ' + esc(ago(D.dataAt)) + '. WTA: everything straight from the WTA through the Baseline service, live scores every 20 s.' : 'Live from atptour.com · scores every 20 s, everything else every 5 min')}</small></div></div>
         </div>
       </section>
     </div>`;
@@ -1013,7 +1174,7 @@
       <div class="pl-head">${avatar(p, 'lg')}<div style="flex:1;min-width:0"><div class="eyebrow">${flag(p.country)} ${esc(p.country || '')}${sg?.age ? ' · Age ' + esc(sg.age) : ''}</div><h3>${esc(p.name)}</h3><div class="muted" style="font-size:13px;margin-top:4px;${st.live ? 'color:var(--live);font-weight:700' : ''}">${esc(st.text)}</div></div></div>
       <div class="stat-row">
         <div class="stat"><b class="num">${sg ? sg.rank : '–'}</b><span>Singles</span></div>
-        ${D.tour === 'wta' ? `<div class="stat"><b class="num">${sg ? fmtNum(sg.points) : '–'}</b><span>Points</span></div>` : `<div class="stat"><b class="num">${rc ? rc.rank : ng ? ng.rank : lv ? lv.rank : '–'}</b><span>${rc ? 'Race' : ng ? 'Next Gen' : 'Live'}</span></div>`}
+        <div class="stat"><b class="num">${rc ? rc.rank : ng ? ng.rank : lv ? lv.rank : '–'}</b><span>${rc ? 'Race' : ng ? 'Next Gen' : 'Live'}</span></div>
         <div class="stat"><b class="num">${db ? db.rank : '–'}</b><span>Doubles</span></div>
       </div>
       <div style="display:flex;gap:8px"><button class="btn" style="flex:1" data-fav="${esc(id)}">${isFav(id) ? ICON.star + ' Following' : ICON.starO + ' Follow'}</button>
@@ -1046,7 +1207,7 @@
         ['Movement', mv],
         ['Events counted', r.tourns ?? '–'],
         L && L.r.points !== r.points ? ['Live', `No. ${L.r.rank} · ${fmtNum(L.r.points)}${L.r.points !== r.points ? `<small class="${L.r.points > r.points ? 'pos' : 'neg'}">${L.r.points > r.points ? '+' : ''}${fmtNum(L.r.points - r.points)} this week</small>` : ''}`] : null,
-        R ? ['Race to Turin', `No. ${R.r.rank} · ${fmtNum(R.r.points)}<small class="muted">points this season</small>`] : N ? ['Next Gen race', `No. ${N.r.rank} · ${fmtNum(N.r.points)}`] : null,
+        R ? [D.tour === 'wta' ? 'Race to the Finals' : 'Race to Turin', `No. ${R.r.rank} · ${fmtNum(R.r.points)}<small class="muted">points this season</small>`] : N ? ['Next Gen race', `No. ${N.r.rank} · ${fmtNum(N.r.points)}`] : null,
         r.dropping ? ['Dropping next', `${fmtNum(r.dropping)}${r.nextBest ? `<small class="muted">next best ${fmtNum(r.nextBest)}</small>` : ''}`] : null,
         above ? [`Behind No. ${above.rank}`, `${fmtNum(above.points - r.points)}<small class="muted">${nameOf(above)}</small>`] : ['World No. 1', below ? `Leads by ${fmtNum(r.points - below.points)}` : '–'],
         below && above ? [`Ahead of No. ${below.rank}`, `${fmtNum(r.points - below.points)}<small class="muted">${nameOf(below)}</small>`] : null,
@@ -1347,7 +1508,8 @@
     if (wtaBusy) return; wtaBusy = true;
     try {
       const W = await loadWta(DW, { matchesOnly: matchesOnly && !!DW });
-      DW = W; S.wtaError = null; cacheW.save(DW);
+      const prevLive = DW && DW.live; DW = W; S.wtaError = null; cacheW.save(DW);
+      if (prevLive) withD(DW, () => diffLive(prevLive, DW.live));
       if (S.tour === 'wta' && !document.querySelector('input:focus, select:focus')) { S._keepScroll = true; render(); }
     } catch (e) { S.wtaError = String(e && e.message || e); if (S.tour === 'wta' && !DW) render(); }
     finally { wtaBusy = false; }
@@ -1399,6 +1561,7 @@
     };
   }
   window.BaselineApp = { boot, diffLive: (a, b) => diffLive(a, b), get data() { return D; }, widget: widgetSummary,
+    wtaGroups: async (tid, year) => { const t = DW.tournaments.find((x) => x.id === String(tid)); const j = await espnJson(`${SERVICE()}/wta/matches/${tid}/${year}`, 60e3); const ev = wtaEvent({ ...t, year }, j).event; return { groups: ev.groups.map((g) => g.name + ': ' + g.rows.map((r) => `${r.pos}. ${r.players.map((p) => p.name.split(' ').pop()).join('/')} ${r.matches}`).join(', ')), bracket: ev.draws && ev.draws.rounds.map((r) => r.name + ' ' + r.matches.length) }; },
     espnEvent: async (tid, year) => { const t = tById(tid); delete S.espn[tid + ':' + year]; await loadEspnEvent(t, year); const E = S.espn[tid + ':' + year]; return E.ev ? { name: E.ev.name, where: E.ev.where, matches: E.ev.matches.length } : E; } };
   boot();
 })();
