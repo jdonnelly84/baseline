@@ -205,7 +205,9 @@
       const r = await fetch(url, { credentials: 'omit', cache: 'no-store' });
       if (!r.ok) throw new Error('ESPN ' + r.status);
       const rec = { t: Date.now(), v: shrink(await r.json()) };
-      espnMem.set(url, rec); kv.set(url, rec);
+      // fast-changing feeds (live scores) are kept in memory; the offline copy on the phone is refreshed every 2 minutes
+      const prevRec = espnMem.get(url); espnMem.set(url, rec);
+      if (maxAge >= 60e3 || !prevRec || !prevRec.saved || rec.t - prevRec.saved > 120e3) { rec.saved = rec.t; kv.set(url, rec); } else rec.saved = prevRec.saved;
       return rec.v;
     } catch (e) { if (hit) return hit.v; throw e; }
   }
@@ -226,11 +228,12 @@
   const espnEids = new Map(); // ATP id → ESPN athlete id, learnt from ESPN's rankings and matches
 
   // A week of ESPN's scoreboard, cut down to the men's events and what Baseline shows.
-  function shrinkWeek(j) {
+  const shrinkWeek = (j) => shrinkWeekFor(j, 'mens');
+  function shrinkWeekFor(j, who) {
     return (j.events || []).map((e) => {
       const matches = [];
       for (const g of e.groupings || []) {
-        const slug = g.grouping && g.grouping.slug; if (slug !== 'mens-singles' && slug !== 'mens-doubles') continue;
+        const slug = g.grouping && g.grouping.slug; if (slug !== who + '-singles' && slug !== who + '-doubles') continue;
         for (const c of g.competitions || []) {
           const note = (c.notes && c.notes[0] && c.notes[0].text) || '';
           const side = (x) => {
@@ -246,7 +249,7 @@
             };
           };
           const cs = [...(c.competitors || [])].sort((a, b) => (a.order || 0) - (b.order || 0));
-          matches.push({ id: c.id, dbl: slug === 'mens-doubles', round: (c.round && c.round.displayName) || '', utc: c.date, timed: !!c.timeValid,
+          matches.push({ id: c.id, dbl: slug === who + '-doubles', round: (c.round && c.round.displayName) || '', utc: c.date, timed: !!c.timeValid,
             state: c.status && c.status.type && c.status.type.state, status: c.status && c.status.type && c.status.type.name,
             court: (c.venue && c.venue.court) || '', note, a: side(cs[0]), b: side(cs[1]) });
         }
@@ -256,7 +259,7 @@
     }).filter((e) => e.matches.length);
   }
   const ymd = (d) => d.toISOString().slice(0, 10).replace(/-/g, '');
-  const espnWeek = (date, maxAge) => espnJson(`${ESPN}/scoreboard?dates=${ymd(date)}`, maxAge, shrinkWeek);
+  const espnWeek = (date, maxAge, tour = 'atp') => espnJson(`${ESPN_ROOT}/${tour}/scoreboard?dates=${ymd(date)}`, maxAge, (j) => shrinkWeekFor(j, tour === 'wta' ? 'womens' : 'mens'));
   const espnNow = () => espnJson(`${ESPN}/scoreboard`, 2 * 60e3, shrinkWeek);
   // Which ESPN event is this ATP tournament? Same city (or the same name), weeks overlapping.
   function espnMatch(t, events) {
@@ -296,14 +299,27 @@
       winner: a && a.won ? 0 : b && b.won ? 1 : null, message: ret ? (/w\/o|walkover/i.test(m.note + m.status) ? 'Walkover' : 'Retired') : '', utc: m.utc };
   }
   // Results for an ATP tournament in a given year, straight from ESPN (cached on the phone; finished weeks never change).
+  // The WTA has no match data for a few small events; ESPN's WTA scoreboard often does.
+  async function espnWtaFallback(t, year) {
+    try {
+      const shift = (Number(t.start.slice(0, 4)) - year) * 364 * 864e5;
+      const base = dateFrom(t.start).getTime() - shift + 2 * 864e5;
+      for (const off of [0, -7, 7]) {
+        const ev = espnMatch(t, await espnWeek(new Date(base + off * 864e5), 30 * 864e5, 'wta'));
+        if (ev && ev.matches.some((m) => m.state === 'post')) return { ev };
+        if (!shift) break;
+      }
+    } catch (e) { /* fall through */ }
+    return { error: `Neither the WTA nor ESPN has ${year} results for this event.` };
+  }
   async function loadEspnEvent(t, year) {
     const key = (D.tour || 'atp') + t.id + ':' + year;
     if (S.espn[key] && !S.espn[key].error) return;
     S.espn[key] = { loading: true };
     if (D.tour === 'wta') {
-      try { const list = await loadWtaPast(t, year, dateFrom(t.end || t.start).getTime() + (Number(t.start.slice(0, 4)) - year) * 365 * 864e5 + 3 * 864e5 < Date.now()); S.espn[key] = list.length ? { wta: list } : { error: `No ${year} results for this event.` }; }
+      try { const list = await loadWtaPast(t, year, dateFrom(t.end || t.start).getTime() + (Number(t.start.slice(0, 4)) - year) * 365 * 864e5 + 3 * 864e5 < Date.now()); S.espn[key] = list.length ? { wta: list } : await espnWtaFallback(t, year); }
       catch (e) { S.espn[key] = { error: 'Couldn’t load the results. Check your connection and try again.' }; }
-      S._keepScroll = true; render(); return;
+      refresh(); return;
     }
     try {
       const shift = (Number(t.start.slice(0, 4)) - year) * 364 * 864e5;
@@ -317,7 +333,7 @@
       }
       S.espn[key] = ev ? { ev } : { error: 'ESPN doesn’t have this event.' };
     } catch (e) { S.espn[key] = { error: 'Couldn’t reach ESPN. Check your connection and try again.' }; }
-    S._keepScroll = true; render();
+    refresh();
   }
   function espnResultsView(t, year) {
     const E = S.espn[(D.tour || 'atp') + t.id + ':' + year];
@@ -350,7 +366,7 @@
     const shown = list.filter((m) => m.round === rd).sort((a, b) => (a.utc > b.utc) - (a.utc < b.utc));
     const win = champ ? (champ.winner === 0 ? champ.a : champ.b) : null, lose = champ ? (champ.winner === 0 ? champ.b : champ.a) : null;
     return `<div class="seg">${[['sgl', 'Singles'], ['dbl', 'Doubles']].map(([k, l]) => `<button data-restype="${k}" class="${S.resType === k ? 'on' : ''}">${l}</button>`).join('')}</div>
-      ${win ? `<button class="list fav-card champ" data-player="${esc(win.players[0].id || '')}">${win.players.length === 1 ? avatar(win.players[0]) : ''}<div><b>${win.players.map((p) => `${flag(p.country)} ${esc(win.players.length > 1 ? shortName(p) : pname(p))}`).join(' / ')}</b><div class="st">Beat ${esc(lose.players.map((p) => shortName(p)).join(' / '))} ${esc(win.sets.map((x, i) => `${x.g}-${lose.sets[i]?.g ?? ''}`).join(' '))}</div></div><span class="crown">${year} champion</span></button>` : ''}
+      ${win ? `<button class="list fav-card champ" data-player="${esc(win.players[0].id || '')}">${win.players.length === 1 ? avatar(win.players[0]) : ''}<div><b>${win.players.map((p) => `${flag(p.country)} ${esc(win.players.length > 1 ? shortName(p) : pname(p))}`).join(' / ')}</b><div class="st">Beat ${esc(lose.players.map((p) => shortName(p)).join(' / '))} ${esc(champ.message === 'Walkover' ? 'by walkover' : win.sets.map((x, i) => `${x.g}-${lose.sets[i]?.g ?? ''}`).join(' '))}${champ.message === 'Retired' ? ' (retired)' : ''}</div></div><span class="crown">${year} champion</span></button>` : ''}
       ${rounds.length ? `<label class="pick"><span>Round</span><select class="select" id="roundsel">${rounds.map((r) => `<option value="${esc(r)}" ${r === rd ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select></label>` : ''}
       ${shown.length ? shown.map((m) => matchCard(m, { showEvent: false })).join('') : '<div class="empty">No matches in this round.</div>'}
       <p class="note" style="text-align:center">Results from the WTA.</p>`;
@@ -455,7 +471,7 @@
     }
     return [A, B];
   }
-  const wtaWinner = (m) => ({ 2: 0, 4: 0, 3: 1, 5: 1 }[m.Winner] ?? null); // 4/5: won by retirement or walkover
+  const wtaWinner = (m) => ({ 2: 0, 4: 0, 6: 0, 3: 1, 5: 1, 7: 1 }[m.Winner] ?? null); // 4/5: won by retirement, 6/7: by walkover
   const wtaNum = (m) => parseInt(String(m.MatchID || '').slice(2), 10) || 0;
   const wtaMain = (m) => m.DrawLevelType !== 'Q' && /^L/.test(m.MatchID || '');
   function wtaRound(m) {
@@ -469,15 +485,45 @@
     const w = wtaWinner(m); a.won = w === 0; b.won = w === 1;
     const state = m.MatchState === 'F' ? 'finished' : m.MatchState === 'P' ? 'live' : m.MatchState === 'U' ? 'scheduled' : sa.length ? 'suspended' : 'scheduled';
     return { id: m.MatchID, round: wtaRound(m), court: m.CourtName || '', doubles: m.DrawMatchType === 'D', state, a, b, winner: w,
-      duration: m.MatchTimeTotal || '', notes: /^[45]$/.test(m.Winner) ? 'Retired' : '', game: [m.PointA, m.PointB], serve: m.Serve, utc: m.MatchTimeStamp || null, raw: m };
+      duration: m.MatchTimeTotal || '', notes: /^[45]$/.test(m.Winner) ? 'Retired' : /^[67]$/.test(m.Winner) ? 'Walkover' : '', game: [m.PointA, m.PointB], serve: m.Serve, utc: m.MatchTimeStamp || null, raw: m };
   }
   // The draw: WTA numbers main-draw matches like a family tree (the final is 1, its two semis 2 and 3, match n is fed
   // by 2n and 2n+1), so the bracket order, byes and each player's path come straight from the numbers.
+  // Works down from the latest round: each match's two players came from the matches they won in the round before.
+  // Exact for finished draws; while a draw is under way the later rounds aren't known yet, so it's marked `loose`
+  // (rounds are shown, and paths only list opponents that are certain).
+  function traceDraw(list, dbl) {
+    const ms = list.filter((x) => wtaMain(x.raw) && x.doubles === dbl && x.size && x.round !== 'Round Robin');
+    if (!ms.length) return null;
+    const bySize = new Map(); ms.forEach((x) => { if (!bySize.has(x.size)) bySize.set(x.size, []); bySize.get(x.size).push(x); });
+    const sizes = [...bySize.keys()].sort((a, b) => a - b);
+    const key = (tm) => ((tm && tm.players) || []).map((p) => p.id || p.name).sort().join('|');
+    const byId = (a, b) => wtaNum(a.raw) - wtaNum(b.raw);
+    let loose = sizes[0] !== 2;
+    const levels = [bySize.get(sizes[0]).slice().sort(byId)];
+    for (let i = 1; i < sizes.length; i++) {
+      if (sizes[i] !== sizes[i - 1] * 2) loose = true;
+      const pool = bySize.get(sizes[i]); const used = new Set(); const next = [];
+      const from = (tm) => { const k = key(tm); if (!k) return null; const c = pool.find((x) => !used.has(x) && (key(x.a) === k || key(x.b) === k)); if (c) used.add(c); return c || null; };
+      for (const m of levels[levels.length - 1]) next.push(m ? from(m.a) : null, m ? from(m.b) : null);
+      const rest = pool.filter((x) => !used.has(x)).sort(byId);
+      if (rest.length) { loose = true; next.push(...rest); }
+      levels.push(next);
+    }
+    const tba = () => ({ players: [], seed: null, entry: null, sets: [], won: false });
+    const rounds = levels.reverse().map((row, i) => {
+      const size = sizes[sizes.length - 1 - i];
+      return { name: size === 2 ? 'Final' : size === 4 ? 'Semi-Finals' : size === 8 ? 'Quarter-Finals' : `Round of ${size}`,
+        matches: row.filter((x) => x || !loose).map((x) => (x ? { a: x.a, b: x.b, winner: x.winner, id: x.id } : { a: tba(), b: tba(), winner: null, id: null })) };
+    });
+    return { rounds, loose };
+  }
   function wtaDraw(list, dbl, finals = false) {
     const by = new Map();
     list.forEach((x) => { if (wtaMain(x.raw) && x.doubles === dbl && (!finals || wtaNum(x.raw) < 4)) by.set(wtaNum(x.raw), x); });
     if (!by.size) return null;
     const levels = Math.floor(Math.log2(Math.max(...by.keys()))) + 1;
+    if (levels > 8) return traceDraw(list, dbl); // more than a 256 draw: not draw numbering
     const tba = () => ({ players: [], seed: null, entry: null, sets: [], won: false });
     const bye = () => ({ players: [{ id: null, name: 'Bye', country: null }], seed: null, entry: null, sets: [], won: false });
     const winnerOf = (x) => (x && x.winner != null ? (x.winner === 0 ? x.a : x.b) : null);
@@ -531,6 +577,26 @@
     const list = ((json && json.matches) || []).filter((m) => m.MatchID && (m.PlayerNameLastA || m.PlayerIDA)).map(wtaMatch);
     const finals = t.type === 'WC';
     if (finals) list.forEach((x) => { if (wtaMain(x.raw) && wtaNum(x.raw) >= 4) x.round = 'Round Robin'; });
+    const numbered = {};
+    for (const dbl of [false, true]) {
+      const main = list.filter((x) => wtaMain(x.raw) && x.doubles === dbl && x.round !== 'Round Robin');
+      const heap = main.length > 0 && main.every((x) => wtaNum(x.raw) > 0 && wtaNum(x.raw) < 256);
+      numbered[dbl] = heap;
+      const drawSize = dbl ? t.dbl : t.sgl;
+      const first = drawSize ? 2 ** Math.ceil(Math.log2(drawSize)) : 0;
+      const played = main.filter((x) => x.raw.MatchState !== 'U' && /^\d+$/.test(String(x.raw.RoundID)));
+      const most = played.length ? Math.max(...played.map((x) => +x.raw.RoundID)) : 0;
+      for (const x of main) {
+        let size = null;
+        if (heap) size = 2 ** (Math.floor(Math.log2(wtaNum(x.raw))) + 1);
+        else {
+          const r = String(x.raw.RoundID);
+          if (r === 'F') size = 2; else if (r === 'S') size = 4; else if (r === 'Q') size = 8;
+          else if (/^\d+$/.test(r)) size = x.raw.MatchState === 'U' ? 2 ** +r : first ? first >> (+r - 1) : 2 ** (most - +r + 4);
+        }
+        if (size && size >= 2 && size <= 256) { x.size = size; x.round = size === 2 ? 'Final' : size === 4 ? 'Semi-Finals' : size === 8 ? 'Quarter-Finals' : `Round of ${size}`; }
+      }
+    }
     const results = (dbl) => {
       const byDay = {};
       list.filter((x) => x.doubles === dbl && x.state === 'finished').forEach((x) => { const k = x.utc ? isoDayIn(x.utc) : '0'; (byDay[k] ||= []).push(x); });
@@ -552,7 +618,7 @@
       a: { ...x.a, game: x.game[0] }, b: { ...x.b, game: x.game[1] } }));
     const rr = finals ? list.filter((x) => x.round === 'Round Robin') : [];
     const groups = finals ? [...wtaGroups(rr.filter((x) => !x.doubles), false), ...wtaGroups(rr.filter((x) => x.doubles), true)] : [];
-    return { event: { results: results(false), resultsDbl: results(true), schedule, draws: wtaDraw(list, false, finals), drawsDbl: wtaDraw(list, true, finals), groups },
+    return { event: { results: results(false), resultsDbl: results(true), schedule, draws: numbered[false] ? wtaDraw(list, false, finals) : traceDraw(list, false), drawsDbl: numbered[true] ? wtaDraw(list, true, finals) : traceDraw(list, true), groups },
       live: live.length ? { id: t.id, title: t.name, city: t.city, matches: live } : null, list };
   }
   const wtaRows = (arr) => (Array.isArray(arr) ? arr : (arr && arr.content) || []).map((r) => {
@@ -596,7 +662,7 @@
     const best = new Map();
     for (const x of list) {
       if (x.doubles !== dbl || !wtaMain(x.raw) || x.state === 'scheduled') continue;
-      const k = roundKey(x.round); if (!k) continue; const lvl = wtaNum(x.raw);
+      const k = roundKey(x.round); if (!k) continue; const lvl = x.size || wtaNum(x.raw);
       [[x.a, 0], [x.b, 1]].forEach(([tm, side]) => tm.players.forEach((p) => { if (!p.id) return; const b = best.get(p.id); if (b && b.lvl <= lvl) return; best.set(p.id, { lvl, k, done: x.winner != null, won: x.winner === side }); }));
     }
     for (const [id, b] of best) { const key = b.done && b.won ? NEXT_ROUND[b.k] : b.k; out.set(id, { pts: tbl[key] ?? 0, round: key, out: b.done && !b.won }); }
@@ -718,7 +784,7 @@
   // Player photos: ESPN has them, matched by name through ESPN's WTA rankings
   function wtaPhotos(W) {
     espnJson(`${ESPN_ROOT}/wta/rankings`, 12 * 3600e3, (j) => ((j.rankings && j.rankings[0] && j.rankings[0].ranks) || []).map((r) => ({ eid: r.athlete && r.athlete.id, name: r.athlete && r.athlete.displayName })))
-      .then((rk) => { rk.forEach((r) => { const id = atpId(r.name, W); if (id && r.eid) espnEids.set(id, r.eid); }); if (S.tour === 'wta') { S._keepScroll = true; render(); } }).catch(() => {});
+      .then((rk) => { rk.forEach((r) => { const id = atpId(r.name, W); if (id && r.eid) espnEids.set(id, r.eid); }); if (S.tour === 'wta') refresh(); }).catch(() => {});
   }
   // Results of a WTA tournament in any year (completed events, and last year's edition of upcoming ones)
   async function loadWtaPast(t, year, done) {
@@ -751,6 +817,17 @@
     return list;
   }
   function drawPath(draw, pid) {
+    if (draw.loose) {
+      const has = (tm) => ((tm && tm.players) || []).some((p) => p.id === pid);
+      const rounds = []; let lostIn = null;
+      for (const r of draw.rounds) {
+        const m = r.matches.find((x) => has(x.a) || has(x.b)); if (!m) continue;
+        const mine = has(m.a) ? m.a : m.b, opp = mine === m.a ? m.b : m.a;
+        if (m.winner != null) { const won = (m.winner === 0 ? m.a : m.b) === mine; rounds.push({ name: r.name, played: true, won, opp: [opp] }); if (!won) { lostIn = r.name; break; } }
+        else rounds.push({ name: r.name, played: false, opp: opp && opp.players && opp.players.length ? [opp] : [] });
+      }
+      return rounds.length ? { rounds: rounds.filter((r) => r.played || r.opp.length), lostIn } : null;
+    }
     const slot = findSlot(draw, pid); if (slot < 0) return null;
     const { out } = drawIndex(draw);
     const rounds = [];
@@ -774,7 +851,39 @@
 
   // ---------------------------------------------------------------- rendering: shell
   const TABS = [['scores', 'Scores'], ['calendar', 'Calendar'], ['news', 'News'], ['rankings', 'Rankings'], ['following', 'Following']];
+  // Problems are kept on the phone (Following → Settings shows them) and sent to the Baseline service, so a crash
+  // can be looked at afterwards. Nothing personal is included: the message, where in the app, the screen size and build.
+  function logProblem(where, e) {
+    const item = { at: new Date().toISOString(), where, msg: String((e && e.message) || e || '').slice(0, 300), stack: String((e && e.stack) || '').split('\n').slice(0, 5).join(' | ').slice(0, 700),
+      tour: S.tour, tab: S.tab, view: S.view ? S.view.sub || 'event' : '', sheet: !!S.sheet, size: (document.documentElement.dataset.size || '') + ' ' + innerWidth + 'x' + innerHeight, build: window.BASELINE_BUILD || '' };
+    try { const a = store.get('problems', []); a.unshift(item); store.set('problems', a.slice(0, 15)); } catch (x) { /* storage full */ }
+    try { const svc = window.BASELINE_ALERTS; if (svc && navigator.sendBeacon) navigator.sendBeacon(svc + '/log', JSON.stringify(item)); } catch (x) { /* offline */ }
+  }
+  addEventListener('error', (e) => { if (e && (e.error || e.message) && !/Script error/.test(e.message || '')) logProblem('error', e.error || e.message); });
+  addEventListener('unhandledrejection', (e) => logProblem('promise', e && e.reason));
+  let touching = false; // a finger is on the screen
+  const shown = { top: null, screen: null, nav: null };
+  const put = (id, html) => { if (shown[id] !== html) { $('#' + id).innerHTML = html; shown[id] = html; } };
   function render() {
+    try { renderIn(); }
+    catch (e) {
+      logProblem('render', e);
+      // step back to somewhere safe and say so, rather than leaving a frozen screen
+      shown.top = shown.screen = shown.nav = null;
+      if (S.sheet) S.sheet = null; else if (S.view) S.view = null; else { S.tab = 'scores'; S.scoresSub = 'all'; }
+      try { renderIn(); toast('That screen hit a problem', 'Baseline went back a step. It’s been noted so it can be fixed.'); }
+      catch (e2) { logProblem('render-again', e2); $('#screen').innerHTML = '<div class="pad"><div class="empty">Something went wrong showing this. <button class="btn" onclick="location.reload()">Reload Baseline</button></div></div>'; }
+    }
+  }
+  // For updates that arrive on their own (live scores every 20 s and so on): never redraw under a finger or while
+  // the list is still moving; catch up a moment after it stops.
+  let lastScrollAt = 0, idleTimer = null;
+  function refresh() {
+    if (touching || Date.now() - lastScrollAt < 900 || document.querySelector('input:focus, select:focus')) { S._refreshDue = true; whenIdle(); return; }
+    S._refreshDue = false; S._keepScroll = true; render();
+  }
+  function whenIdle() { clearTimeout(idleTimer); idleTimer = setTimeout(() => { if (S._refreshDue) refresh(); }, 1000); }
+  function renderIn() {
     D = (S.tour === 'wta' ? DW : DA) || DA || D;
     if (S.tour === 'wta' && !DW) S._wtaWaiting = true;
     document.documentElement.dataset.tourview = S.tour === 'wta' && DW ? 'wta' : 'atp';
@@ -784,16 +893,16 @@
     if (S.tour === 'wta' && !DW) {
       head = `<div class="top-row"><h1>${esc(TABS.find(([k]) => k === S.tab)?.[1] || 'WTA')}</h1>${tourSwitch()}</div><div class="sub">WTA</div><div class="tabs lone"></div>`;
       body = `<div class="pad"><div class="empty">${S.wtaError ? `Couldn’t load the WTA right now (${esc(S.wtaError)}). Check your connection; it tries again shortly.` : 'Loading the WTA…'}</div></div>`;
-      $('#top').innerHTML = head; $('#screen').innerHTML = body;
-      $('#nav').innerHTML = TABS.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k && !S.view ? 'on' : ''}" aria-label="${l}">${ICON[k]}<span>${l}</span></button>`).join('');
+      put('top', head); put('screen', body);
+      put('nav', TABS.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k && !S.view ? 'on' : ''}" aria-label="${l}">${ICON[k]}<span>${l}</span></button>`).join(''));
       if (S.tab !== 'following') return;
       head = ''; body = '';
     }
     if (S.view && S.view.type === 'tournament') ({ head, body } = viewTournament(S.view));
     else ({ head, body } = ({ scores: viewScores, calendar: viewCalendar, news: viewNews, rankings: viewRankings, following: viewFollowing }[S.tab])());
-    $('#top').innerHTML = head;
-    $('#screen').innerHTML = body;
-    $('#nav').innerHTML = TABS.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k && !S.view ? 'on' : ''}" aria-label="${l}">${ICON[k]}<span>${l}</span>${k === 'following' && S.unread ? `<span class="dot">${S.unread}</span>` : ''}</button>`).join('');
+    put('top', head);
+    put('screen', body);
+    put('nav', TABS.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k && !S.view ? 'on' : ''}" aria-label="${l}">${ICON[k]}<span>${l}</span>${k === 'following' && S.unread ? `<span class="dot">${S.unread}</span>` : ''}</button>`).join(''));
     renderSheet({ soft: true });
     if (S._keepScroll) { $('#screen').scrollTop = keep; S._keepScroll = false; }
     if (S._scrollTo) { const el = document.getElementById(S._scrollTo); if (el) $('#screen').scrollTop = el.offsetTop - 60; S._scrollTo = null; }
@@ -962,8 +1071,8 @@
     const key = t.id + ':' + t.year; const E = S.entry[key];
     if (E === undefined) {
       S.entry[key] = null;
-      espnJson(`${SERVICE()}/wta/players/${t.id}/${t.year}`, 3 * 3600e3).then((j) => { S.entry[key] = ((j && j.events) || []).find((e) => e.eventTypeCode === 'LS' && (e.eventPlayers || []).length) || false; S._keepScroll = true; render(); })
-        .catch(() => { S.entry[key] = false; S._keepScroll = true; render(); });
+      espnJson(`${SERVICE()}/wta/players/${t.id}/${t.year}`, 3 * 3600e3).then((j) => { S.entry[key] = ((j && j.events) || []).find((e) => e.eventTypeCode === 'LS' && (e.eventPlayers || []).length) || false; refresh(); })
+        .catch(() => { S.entry[key] = false; refresh(); });
     }
     if (E === null || E === undefined) return '<div class="empty">Loading the entry list…</div>';
     if (!E) return `<p class="note" style="margin:0">The WTA hasn’t published the entry list yet, so this is a projection.</p>${fieldView(t)}`;
@@ -1050,7 +1159,9 @@
     if (!lists.some(([k]) => k === S.rkList)) S.rkList = lists[0][0];
     const R = D.rankings[S.rkList] || { rows: [] };
     const q = S.rkQuery.trim().toLowerCase();
-    const rows = R.rows.filter((r) => !q || r.players.some((p) => pname(p).toLowerCase().includes(q)));
+    const all = R.rows.filter((r) => !q || r.players.some((p) => pname(p).toLowerCase().includes(q)));
+    // the first 60 straight away (fast to open); the rest a tap away. Searching always covers everyone.
+    const rows = q || S.rkMore ? all : all.slice(0, 60);
     const cut = { sgl_race: 8, nextgen: 7, dbl_race: 8 }[S.rkList];
     const head = `<div class="top-row"><h1>Rankings</h1>${tourSwitch()}</div><div class="sub">${D.tour === 'wta' ? 'WTA Rankings' : 'PIF ATP Rankings'}${R.asOf ? ' · ' + esc(R.asOf.replace(/\./g, '-')) : ''}</div>
       <div class="tabs">${lists.map(([k, l]) => `<button data-rklist="${k}" class="${S.rkList === k ? 'on' : ''}">${l}</button>`).join('')}</div>`;
@@ -1075,6 +1186,7 @@
           ${r.players.length === 1 ? `<button class="star ${fav ? 'on' : ''}" data-fav="${esc(r.players[0].id)}" aria-label="${fav ? 'Unfollow' : 'Follow'}">${fav ? ICON.star : ICON.starO}</button>` : '<span></span>'}
         </div>`;
       }).join('') || '<div class="empty">No players match that search.</div>'}</div>
+      ${rows.length < all.length ? `<button class="btn ghost" data-rkmore>Show all ${all.length} players</button>` : ''}
     </div>`;
     return { head, body };
   }
@@ -1134,6 +1246,7 @@
           <div class="toggle-row"><div class="lbl"><b>Time zone</b><small>Match times are converted to this</small></div><select class="select" id="tzsel">${['', 'Pacific/Auckland', 'Australia/Sydney', 'Asia/Shanghai', 'Asia/Tokyo', 'Europe/London', 'Europe/Paris', 'America/New_York', 'America/Los_Angeles', 'UTC'].map((z) => `<option value="${z}" ${(S.tz || '') === z ? 'selected' : ''}>${z ? z.split('/').pop().replace('_', ' ') : 'This device (' + esc(Intl.DateTimeFormat().resolvedOptions().timeZone.split('/').pop().replace('_', ' ')) + ')'}</option>`).join('')}</select></div>
           <div class="toggle-row"><div class="lbl"><b>Appearance</b></div><div class="seg" style="min-width:210px">${[['system', 'Auto'], ['dark', 'Dark'], ['light', 'Light']].map(([k, l]) => `<button data-theme-set="${k}" class="${S.theme === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
           <div class="toggle-row"><div class="lbl"><b>Top spacing</b><small>If the top of Baseline sits under the clock or camera, pick More</small></div><div class="seg" style="min-width:190px">${[['auto', 'Auto'], ['on', 'More'], ['off', 'Less']].map(([k, l]) => `<button data-topfix="${k}" class="${S.topFix === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+          ${store.get('problems', []).length ? `<div class="toggle-row"><div class="lbl"><b>Recent problems</b><small>${esc(store.get('problems', []).slice(0, 3).map((x) => `${ago(x.at)}: ${x.msg} (${x.tour} ${x.tab}${x.view ? ' ' + x.view : ''})`).join(' · '))}</small></div><button class="btn ghost" data-clearproblems style="padding:8px 12px">Clear</button></div>` : ''}
           <div class="toggle-row"><div class="lbl"><b>This screen</b><small>${esc([SCREEN.model ? SCREEN.model + ' size' : null, SCREEN.size, 'layout ' + (document.documentElement.dataset.size || '?'), 'top ' + SCREEN.top + (SCREEN.fallback ? ' (fixed)' : ''), SCREEN.standalone ? 'Home Screen app' : 'in browser'].filter(Boolean).join(' · '))}</small></div></div>
           <div class="toggle-row"><div class="lbl"><b>Data</b><small>${D.source === 'snapshot' ? 'Preview snapshot taken ' + esc(new Date(D.generatedAt).toLocaleString('en-NZ', { timeZone: tz(), day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })) + '. The installed app refreshes live.' : (D.dataAt ? 'ATP: live scores straight from ATP every 20 s; draws, order of play, results and rankings from the updater on your computer, last refreshed ' + esc(ago(D.dataAt)) + '. WTA: everything straight from the WTA through the Baseline service, live scores every 20 s.' : 'Live from atptour.com · scores every 20 s, everything else every 5 min')}</small></div></div>
         </div>
@@ -1145,9 +1258,8 @@
   // ---------------------------------------------------------------- Player sheet
   // soft: refresh the open panel's content in place (live updates, career numbers arriving) without rebuilding it,
   // keeping its scroll position, and never while a finger is on the screen (that would cut a swipe short).
-  let touching = false;
   document.addEventListener('touchstart', () => { touching = true; }, { passive: true, capture: true });
-  const untouch = () => { touching = false; if (S._sheetDue) { S._sheetDue = false; renderSheet({ soft: true }); } };
+  const untouch = () => { touching = false; if (S._refreshDue) whenIdle(); if (S._sheetDue) { S._sheetDue = false; renderSheet({ soft: true }); } };
   document.addEventListener('touchend', untouch, { capture: true }); document.addEventListener('touchcancel', untouch, { capture: true });
   function renderSheet(opts = {}) { if (!S.sheet) return renderSheetIn(opts); return withD(dataFor(S.sheet.id), () => renderSheetIn(opts)); }
   function renderSheetIn({ soft = false } = {}) {
@@ -1338,7 +1450,7 @@
   fit(); addEventListener('resize', fit); addEventListener('orientationchange', () => setTimeout(fit, 250));
   (function () {
     const scr = document.getElementById('screen'), top = document.getElementById('top');
-    if (scr && top) scr.addEventListener('scroll', () => { const on = top.classList.contains('mini'); const y = scr.scrollTop; if (!on && y > 48) top.classList.add('mini'); else if (on && y < 6) top.classList.remove('mini'); }, { passive: true });
+    if (scr && top) scr.addEventListener('scroll', () => { lastScrollAt = Date.now(); if (S._refreshDue) whenIdle(); const on = top.classList.contains('mini'); const y = scr.scrollTop; if (!on && y > 48) top.classList.add('mini'); else if (on && y < 6) top.classList.remove('mini'); }, { passive: true });
   })();
 
   // ---------------------------------------------------------------- theme
@@ -1352,7 +1464,7 @@
     syncPush();
   }
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-back],[data-sub],[data-scoresub],[data-calf],[data-calpast],[data-newsf],[data-rkkind],[data-rklist],[data-fav],[data-player],[data-drawplayer],[data-drawtype],[data-round],[data-restype],[data-notif],[data-perm],[data-pushtest],[data-testnotif],[data-clearfeed],[data-theme-set],[data-closesheet],[data-closesheetbtn],[data-topfix],[data-tour]');
+    const el = e.target.closest('[data-tab],[data-open],[data-back],[data-sub],[data-scoresub],[data-calf],[data-calpast],[data-newsf],[data-rkkind],[data-rklist],[data-fav],[data-player],[data-drawplayer],[data-drawtype],[data-round],[data-restype],[data-notif],[data-perm],[data-pushtest],[data-testnotif],[data-clearfeed],[data-theme-set],[data-closesheet],[data-closesheetbtn],[data-topfix],[data-tour],[data-clearproblems],[data-rkmore]');
     if (!el) return;
     const d = el.dataset;
     if ('closesheet' in d) { if (e.target === el) goBack(); return; }
@@ -1368,8 +1480,8 @@
     else if ('calpast' in d) S.calPast = !S.calPast;
     else if (d.newsf) S.newsFilter = d.newsf;
     else if (d.tour) { if (S.tour === d.tour) return; S.tour = d.tour; store.set('tour', S.tour); if (nav.mine()) { S._quietPop = true; history.go(-(history.state.baseline === 'sheet' && S.view ? 2 : 1)); } S.view = null; S.sheet = null; S.scoresSub = 'all'; S.calFilter = 'all'; S.newsFilter = 'All'; S.rkKind = 'singles'; S.rkList = 'sgl'; S.rkQuery = ''; if (S.tour === 'wta' && !DW) wtaRefresh(); if (S.tab === 'calendar') { render(); const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; } render(); $('#screen').scrollTop = 0; if (S._scrollTo) render(); return; }
-    else if (d.rkkind) { S.rkKind = d.rkkind; S.rkList = (S.tour === 'wta' ? RKW : RK)[d.rkkind][0][0]; }
-    else if (d.rklist) S.rkList = d.rklist;
+    else if (d.rkkind) { S.rkMore = false; S.rkKind = d.rkkind; S.rkList = (S.tour === 'wta' ? RKW : RK)[d.rkkind][0][0]; }
+    else if (d.rklist) { S.rkList = d.rklist; S.rkMore = false; }
     else if (d.drawtype) { S.drawType = d.drawtype; S.drawRound = null; }
     else if (d.round) S.drawRound = +d.round;
     else if (d.restype) { S.resType = d.restype; S.resDay = 0; S.pastRound = null; }
@@ -1389,6 +1501,8 @@
     }
     else if ('testnotif' in d) { testAlert(); return; }
     else if ('clearfeed' in d) { S.feed = []; store.set('feed', []); S._keepScroll = true; }
+    else if ('rkmore' in d) { S.rkMore = true; S._keepScroll = true; }
+    else if ('clearproblems' in d) { store.set('problems', []); S._keepScroll = true; }
     else if (d.topfix) { S.topFix = d.topfix; store.set('topfix', S.topFix); fit(); S._keepScroll = true; }
     else if (d.themeSet) { S.theme = d.themeSet; store.set('theme', S.theme); S._keepScroll = true; }
     render();
@@ -1508,9 +1622,11 @@
     if (wtaBusy) return; wtaBusy = true;
     try {
       const W = await loadWta(DW, { matchesOnly: matchesOnly && !!DW });
-      const prevLive = DW && DW.live; DW = W; S.wtaError = null; cacheW.save(DW);
+      const prevLive = DW && DW.live; DW = W; S.wtaError = null;
+      // keep a copy for instant opening, but not every 20 s: writing half a megabyte that often makes a phone stutter
+      if (!matchesOnly || Date.now() - (S._wtaSavedAt || 0) > 3 * 60e3) { cacheW.save(DW); S._wtaSavedAt = Date.now(); }
       if (prevLive) withD(DW, () => diffLive(prevLive, DW.live));
-      if (S.tour === 'wta' && !document.querySelector('input:focus, select:focus')) { S._keepScroll = true; render(); }
+      if (S.tour === 'wta') refresh();
     } catch (e) { S.wtaError = String(e && e.message || e); if (S.tour === 'wta' && !DW) render(); }
     finally { wtaBusy = false; }
   }
@@ -1534,15 +1650,15 @@
     if (S.tab === 'calendar') { const m = withD((S.tour === 'wta' ? DW : DA) || DA, () => currentEvents()[0]?.start?.slice(0, 7)); if (m) S._scrollTo = 'm-' + m; }
     render();
     wtaRefresh();
-    const fillFromEspn = () => espnRefresh().then((used) => { if (used && S.tour === 'atp' && !document.querySelector('input:focus, select:focus')) { S._keepScroll = true; render(); } }).catch(() => {});
+    const fillFromEspn = () => espnRefresh().then((used) => { if (used && S.tour === 'atp') refresh(); }).catch(() => {});
     if (LIVE_MODE && !DIRECT) { fillFromEspn(); setInterval(() => { if (!document.hidden) fillFromEspn(); }, 3 * 60e3); }
     syncPush(); // keeps the alerts service's copy of followed players and alert switches current
-    PUSH()?.needsTurnOn().then((v) => { if (v !== !!S.pushRenew) { S.pushRenew = v; S._keepScroll = true; render(); } }).catch(() => {});
+    PUSH()?.needsTurnOn().then((v) => { if (v !== !!S.pushRenew) { S.pushRenew = v; refresh(); } }).catch(() => {});
     const calm = () => !document.querySelector('input:focus, select:focus');
     if (LIVE_MODE) {
-      setInterval(async () => { if (document.hidden || !DA) return; try { const A = DA; const L = await loadLive(); const prev = A.live; A.live = L.live; A.generatedAt = L.at; withD(A, () => diffLive(prev, A.live)); if (S.tour === 'atp' && calm()) { S._keepScroll = true; render(); } } catch (e) { /* retry next tick */ } }, 20000);
+      setInterval(async () => { if (document.hidden || !DA) return; try { const A = DA; const L = await loadLive(); const prev = A.live; A.live = L.live; A.generatedAt = L.at; withD(A, () => diffLive(prev, A.live)); if (S.tour === 'atp') refresh(); } catch (e) { /* retry next tick */ } }, 20000);
       // The full refresh re-reads about 30 pages, so on the phone (no server in between) it runs less often.
-      setInterval(async () => { if (document.hidden) return; try { const N = await loadData(); const prev = DA; DA = N; await espnRefresh().catch(() => {}); cache.save(DA); withD(DA, () => diffSchedule(prev, N)); if (S.tour === 'atp' && calm()) { S._keepScroll = true; render(); } } catch (e) { /* retry */ } }, DIRECT ? 600000 : 300000);
+      setInterval(async () => { if (document.hidden) return; try { const N = await loadData(); const prev = DA; DA = N; await espnRefresh().catch(() => {}); cache.save(DA); withD(DA, () => diffSchedule(prev, N)); if (S.tour === 'atp') refresh(); } catch (e) { /* retry */ } }, DIRECT ? 600000 : 300000);
     }
     let wtaTicks = 0;
     setInterval(() => {
