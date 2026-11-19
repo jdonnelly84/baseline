@@ -442,3 +442,8 @@ body { position: fixed; top: 0; left: 0; right: 0; height: 100%; }
 :root[data-tourview="wta"] { --head-a: #3b0f4f; --head-b: #b0287a; }
 @media (prefers-color-scheme: light) { :root[data-tourview="wta"]:not([data-theme="dark"]) { --head-a: #4a1263; --head-b: #c4307f; } }
 :root[data-tourview="wta"][data-theme="light"] { --head-a: #4a1263; --head-b: #c4307f; }
+
+/* long lists: the phone skips laying out and drawing rows that are off screen */
+.list.rk .rk-row { content-visibility: auto; contain-intrinsic-size: auto 58px; }
+.draw-round .dmatch { content-visibility: auto; contain-intrinsic-size: auto 78px; }
+.cal-row { content-visibility: auto; contain-intrinsic-size: auto 68px; }

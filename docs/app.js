@@ -38,6 +38,37 @@
   const tz = () => S.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Pacific/Auckland';
   const nowRef = () => (D && D.source === 'snapshot' ? new Date(D.generatedAt) : new Date());
 
+  // ---------------------------------------------------------------- fast dates and numbers
+  // Formatting a date or number with options builds a new formatter every time, which is slow on a phone when a
+  // screen shows hundreds of dates (the calendar). These keep one formatter per style and reuse it; same output.
+  (function () {
+    const cache = new Map();
+    const has = (o, ks) => ks.some((k) => o[k] !== undefined);
+    const DATE = ['weekday', 'era', 'year', 'month', 'day', 'dateStyle'], TIME = ['hour', 'minute', 'second', 'dayPeriod', 'timeStyle', 'fractionalSecondDigits'];
+    const withDefaults = (kind, o) => {
+      const d = { year: 'numeric', month: 'numeric', day: 'numeric' }, t = { hour: 'numeric', minute: 'numeric', second: 'numeric' };
+      if (kind === 'date' && !has(o, DATE)) return { ...d, ...o };
+      if (kind === 'time' && !has(o, TIME)) return { ...t, ...o };
+      if (kind === 'any' && !has(o, DATE) && !has(o, TIME)) return { ...d, ...t, ...o };
+      return o;
+    };
+    const patch = (proto, name, kind, make) => {
+      const orig = proto[name];
+      proto[name] = function (loc, opts) {
+        if (loc === undefined && opts === undefined) return orig.call(this);
+        try {
+          const k = name + '|' + loc + '|' + (opts ? JSON.stringify(opts) : '');
+          let f = cache.get(k); if (!f) { f = make(loc, opts ? withDefaults(kind, opts) : withDefaults(kind, {})); cache.set(k, f); }
+          return f.format(this);
+        } catch (e) { return orig.call(this, loc, opts); }
+      };
+    };
+    patch(Date.prototype, 'toLocaleDateString', 'date', (l, o) => new Intl.DateTimeFormat(l, o));
+    patch(Date.prototype, 'toLocaleTimeString', 'time', (l, o) => new Intl.DateTimeFormat(l, o));
+    patch(Date.prototype, 'toLocaleString', 'any', (l, o) => new Intl.DateTimeFormat(l, o));
+    patch(Number.prototype, 'toLocaleString', 'num', (l, o) => new Intl.NumberFormat(l, o));
+  })();
+
   // ---------------------------------------------------------------- helpers
   const $ = (s, el = document) => el.querySelector(s);
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -718,29 +749,30 @@
     let W;
     if (matchesOnly && prev) W = { ...prev, events: { ...prev.events }, live: {} };
     else {
-      const pages = await Promise.all([0, 1].map((p) => espnJson(`${base}/tournaments?page=${p}&from=${yr}-01-01&to=${yr}-12-31`, 12 * 3600e3).catch(() => null)));
+      const get = (u, age, fb, shrink) => espnJson(u, age, shrink).catch(() => fb);
+      const [pages, s0, s1, d0, d1, newsRaw, r0, r1, rd, last] = await Promise.all([
+        Promise.all([0, 1].map((p) => get(`${base}/tournaments?page=${p}&from=${yr}-01-01&to=${yr}-12-31`, 12 * 3600e3, null))),
+        get(`${base}/rankings/singles?page=0`, 3 * 3600e3, []), get(`${base}/rankings/singles?page=1`, 3 * 3600e3, []),
+        get(`${base}/rankings/doubles?page=0`, 3 * 3600e3, []), get(`${base}/rankings/doubles?page=1`, 3 * 3600e3, []),
+        get(`${ESPN_ROOT}/wta/news`, 20 * 60e3, [], (j) => (j.articles || []).map((a) => ({ title: a.headline, url: a.links && a.links.web && a.links.web.href, img: a.images && a.images[0] && a.images[0].url, tag: a.type === 'Media' ? 'Video' : 'News', video: a.type === 'Media', author: a.byline || '' }))),
+        get(`${base}/race/singles?page=0`, 3 * 3600e3, []), get(`${base}/race/singles?page=1`, 3 * 3600e3, []), get(`${base}/race/doubles?page=0`, 3 * 3600e3, []),
+        Promise.all([0, 1].map((p) => get(`${base}/tournaments?page=${p}&from=${yr - 1}-01-01&to=${yr - 1}-12-31`, 7 * 864e5, null))),
+      ]);
       const tournaments = pages.flatMap((p) => (p && p.content) || []).map(wtaTournament).filter((t) => t.start).sort((a, b) => (a.start > b.start) - (a.start < b.start));
       if (!tournaments.length) throw new Error('WTA calendar unavailable');
-      const [s0, s1, d0, d1] = await Promise.all([['singles', 0], ['singles', 1], ['doubles', 0], ['doubles', 1]].map(([k, p]) => espnJson(`${base}/rankings/${k}?page=${p}`, 3 * 3600e3).catch(() => [])));
       const sgl = wtaRows([...(s0 || []), ...(s1 || [])]), dbl = wtaRows([...(d0 || []), ...(d1 || [])]);
       const asOf = (sgl[0] && sgl[0].at || '').slice(0, 10);
-      let news = [];
-      try {
-        const n = await espnJson(`${ESPN_ROOT}/wta/news`, 20 * 60e3, (j) => (j.articles || []).map((a) => ({ title: a.headline, url: a.links && a.links.web && a.links.web.href, img: a.images && a.images[0] && a.images[0].url, tag: a.type === 'Media' ? 'Video' : 'News', video: a.type === 'Media', author: a.byline || '' })));
-        news = n.filter((x) => x.url && x.title);
-      } catch (e) { /* news is optional */ }
+      const news = (newsRaw || []).filter((x) => x.url && x.title);
       const players = {};
       const add = (p, k, rank) => { if (!p.id) return; const o = players[p.id] || (players[p.id] = { id: p.id, name: p.name, country: p.country, short: p.name ? p.name.split(' ')[0][0] + '. ' + p.name.split(' ').slice(1).join(' ') : p.name }); if (k) o[k] = rank; };
       sgl.forEach((r) => add(r.players[0], 'rank', r.rank)); dbl.forEach((r) => add(r.players[0], 'dblRank', r.rank));
       // the races to the WTA Finals (singles players, doubles teams)
-      const [r0, r1, rd] = await Promise.all([`${base}/race/singles?page=0`, `${base}/race/singles?page=1`, `${base}/race/doubles?page=0`].map((u) => espnJson(u, 3 * 3600e3).catch(() => [])));
       const race = wtaRows([...(r0 || []), ...(r1 || [])]);
       const teamRace = (Array.isArray(rd) ? rd : []).map((r) => ({ rank: r.ranking, players: [r.player1, r.player2].filter(Boolean).map((p) => ({ id: 'W' + p.id, name: p.fullName, country: p.countryCode })), points: r.points, tourns: r.tournamentsPlayed ?? null, rankMove: r.movement || null, pointsMove: null }));
       race.forEach((r) => add(r.players[0])); teamRace.forEach((r) => r.players.forEach((p) => add(p)));
       // defending champions: last season's winners
       const champions = {};
       try {
-        const last = await Promise.all([0, 1].map((p) => espnJson(`${base}/tournaments?page=${p}&from=${yr - 1}-01-01&to=${yr - 1}-12-31`, 7 * 864e5).catch(() => null)));
         last.flatMap((x) => (x && x.content) || []).forEach((t) => { const w = (t.winners || []).find((x) => x && x.singles && x.singles.player); const gid = t.tournamentGroup && t.tournamentGroup.id; if (w && gid) { const pl = w.singles.player; champions[String(gid)] = 'W' + pl.id; add({ id: 'W' + pl.id, name: pl.fullName, country: pl.countryCode }); } });
       } catch (e) { /* no champions shown */ }
       W = { source: 'live', tour: 'wta', generatedAt: new Date().toISOString(), tournaments, live: {}, events: {}, players,
@@ -750,20 +782,21 @@
       const today = new Date().toISOString().slice(0, 10);
       const upcoming = tournaments.filter((t) => t.start > today && dateFrom(t.start) - Date.now() < 28 * 864e5 && ['GS', '1000', '500', '250', '125', 'WC'].includes(t.type));
       const hist = {};
-      for (const t of upcoming.filter((x) => ['500', '250', '125'].includes(x.type))) {
+      await Promise.all(upcoming.filter((x) => ['500', '250', '125'].includes(x.type)).map(async (t) => {
         try { const l = await loadWtaPast(t, t.year - 1, true); hist[t.id] = new Set(l.filter((x) => !x.doubles).flatMap((x) => [...x.a.players, ...x.b.players].map((p) => p.id)).filter(Boolean)); W.lastYear[t.id] = [...hist[t.id]]; } catch (e) { /* projection without it */ }
-      }
+      }));
       W.projections = wtaProjections(upcoming, W.rankings.sgl, W.rankings.sgl_race, hist);
     }
     if (matchesOnly && prev) W.rankings = { ...prev.rankings };
     const current = [];
-    for (const t of W.tournaments.filter(wtaCurrent)) {
+    const fetched = await Promise.all(W.tournaments.filter(wtaCurrent).map((t) => Promise.all([
+      espnJson(`${base}/matches/${t.id}/${t.year}`, 15e3).catch((e) => e), loadWtaPast(t, t.year - 1, true).catch(() => null)]).then(([j, last]) => ({ t, j, last }))));
+    for (const { t, j, last } of fetched) {
       try {
-        const j = await espnJson(`${base}/matches/${t.id}/${t.year}`, 15e3);
+        if (j instanceof Error) throw j;
         const { event, live, list } = wtaEvent(t, j);
         if (list.length) W.events[t.id] = event;
         if (live) W.live[t.id] = live;
-        let last = null; try { last = await loadWtaPast(t, t.year - 1, true); } catch (e) { /* no drop-offs known */ }
         current.push({ t, list, last });
         list.forEach((x) => [x.a, x.b].forEach((tm) => tm.players.forEach((p) => { if (p.id && !W.players[p.id]) W.players[p.id] = { id: p.id, name: p.name, country: p.country, short: p.name.split(' ')[0][0] + '. ' + p.name.split(' ').slice(1).join(' ') }; })));
       } catch (e) { /* keep what we had for this event */ if (prev && prev.events[t.id]) W.events[t.id] = prev.events[t.id]; }
@@ -905,7 +938,11 @@
     put('nav', TABS.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k && !S.view ? 'on' : ''}" aria-label="${l}">${ICON[k]}<span>${l}</span>${k === 'following' && S.unread ? `<span class="dot">${S.unread}</span>` : ''}</button>`).join(''));
     renderSheet({ soft: true });
     if (S._keepScroll) { $('#screen').scrollTop = keep; S._keepScroll = false; }
-    if (S._scrollTo) { const el = document.getElementById(S._scrollTo); if (el) $('#screen').scrollTop = el.offsetTop - 60; S._scrollTo = null; }
+    if (S._scrollTo) {
+      const id = S._scrollTo; S._scrollTo = null;
+      const go = () => { const el = document.getElementById(id), scr = $('#screen'); if (el) scr.scrollTop += el.getBoundingClientRect().top - scr.getBoundingClientRect().top - 4; };
+      go(); requestAnimationFrame(() => { go(); requestAnimationFrame(go); }); // again once rows above have their real heights
+    }
   }
   const tourSwitch = () => '<div class="tour-switch" role="tablist" aria-label="Tour">' + [['atp', 'ATP'], ['wta', 'WTA']].map(([k, l]) => `<button data-tour="${k}" role="tab" aria-selected="${S.tour === k}" class="${S.tour === k ? 'on' : 'off'}">${l}</button>`).join('') + '</div>';
   function snapNote() {
@@ -1471,7 +1508,7 @@
     if ('closesheetbtn' in d) { goBack(); return; }
     if (d.fav !== undefined) { toggleFav(d.fav); S._keepScroll = true; render(); return; }
     if (d.player !== undefined || d.drawplayer !== undefined) { const id = d.player ?? d.drawplayer; if (id) openSheet(id); return; }
-    if (d.tab) { if (nav.mine()) { S._quietPop = true; history.go(-(history.state.baseline === 'sheet' && S.view ? 2 : 1)); } if (S.tab === d.tab && !S.view) { $('#screen').scrollTop = 0; return; } S.tab = d.tab; S.view = null; S.sheet = null; store.set('tab', S.tab); if (d.tab === 'following') { S.unread = 0; store.set('unread', 0); } if (d.tab === 'calendar') { const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; } render(); if (!S._scrollTo) $('#screen').scrollTop = 0; return; }
+    if (d.tab) { if (nav.mine()) { S._quietPop = true; history.go(-(history.state.baseline === 'sheet' && S.view ? 2 : 1)); } if (S.tab === d.tab && !S.view) { $('#screen').scrollTop = 0; return; } S.tab = d.tab; S.view = null; S.sheet = null; store.set('tab', S.tab); if (d.tab === 'following') { S.unread = 0; store.set('unread', 0); } if (d.tab === 'calendar') { const m = currentEvents()[0]?.start?.slice(0, 7); if (m) S._scrollTo = 'm-' + m; } const jump = !!S._scrollTo; if (!jump) $('#screen').scrollTop = 0; render(); if (!jump) $('#screen').scrollTop = 0; return; }
     if (d.open) { if (!S.view) nav.push('view'); S._prev = { tab: S.tab, scroll: $('#screen').scrollTop }; S.view = { type: 'tournament', id: d.open }; S.drawRound = null; S.drawQuery = ''; S.resDay = 0; S.schedDay = null; S.pastRound = null; render(); $('#screen').scrollTop = 0; return; }
     if ('back' in d) { goBack(); return; }
     if (d.sub) { S.view.sub = d.sub; render(); $('#screen').scrollTop = 0; return; }
